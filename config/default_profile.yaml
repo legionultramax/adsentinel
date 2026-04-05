@@ -1,0 +1,34 @@
+# ADSentinel Default Scan Profile
+# Enable/disable check categories
+
+categories:
+  password_policy: true
+  privileged_accounts: true
+  kerberos_security: true
+  acl_dacl: true
+  adcs: true
+  gpo_security: true
+  trust_security: true
+  dns_security: true
+  object_security: true
+  authentication: true
+  replication: true
+  operational: true
+  hybrid_cloud: true
+  tiered_admin: true
+  coercion: true
+  sccm: true
+
+# Performance settings
+max_concurrent: 10
+page_size: 1000
+
+# Thresholds (override defaults)
+thresholds:
+  password_min_length: 14
+  lockout_threshold: 5
+  password_history: 24
+  max_password_age_days: 90
+  krbtgt_max_age_days: 180
+  stale_days: 90
+  machine_account_quota: 0

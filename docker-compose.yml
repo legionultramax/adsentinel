@@ -1,0 +1,62 @@
+# ADSentinel Docker Compose
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your AD credentials
+#   2. docker-compose run --rm scan          # Full scan with HTML + JSON reports
+#   3. docker-compose run --rm preflight     # Test connectivity first
+#   4. Reports are written to ./reports/
+
+services:
+  # Preflight check — verify connectivity before scanning
+  preflight:
+    build: .
+    env_file: .env
+    command: >
+      preflight
+        --server ${ADSENTINEL_SERVER}
+        --domain ${ADSENTINEL_DOMAIN}
+        --username ${ADSENTINEL_USERNAME}
+        --auth ${ADSENTINEL_AUTH_METHOD:-simple}
+        ${ADSENTINEL_USE_SSL:+--ssl}
+
+  # Full security assessment scan
+  scan:
+    build: .
+    env_file: .env
+    volumes:
+      - ./reports:/app/reports
+    command: >
+      scan
+        --server ${ADSENTINEL_SERVER}
+        --domain ${ADSENTINEL_DOMAIN}
+        --username ${ADSENTINEL_USERNAME}
+        --auth ${ADSENTINEL_AUTH_METHOD:-simple}
+        ${ADSENTINEL_USE_SSL:+--ssl}
+        --html /app/reports/report.html
+        --json /app/reports/report.json
+        --csv /app/reports/report.csv
+        --sarif /app/reports/report.sarif
+        --bloodhound /app/reports/bloodhound.json
+        --baseline-out /app/reports/baseline.json
+        -v
+
+  # Quick scan — HTML report only, no WinRM
+  quick:
+    build: .
+    env_file: .env
+    volumes:
+      - ./reports:/app/reports
+    command: >
+      scan
+        --server ${ADSENTINEL_SERVER}
+        --domain ${ADSENTINEL_DOMAIN}
+        --username ${ADSENTINEL_USERNAME}
+        --auth ${ADSENTINEL_AUTH_METHOD:-simple}
+        ${ADSENTINEL_USE_SSL:+--ssl}
+        --no-winrm
+        --html /app/reports/report.html
+
+  # List all available checks
+  checks:
+    build: .
+    command: checks --list
