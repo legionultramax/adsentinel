@@ -71,6 +71,7 @@ def cli(ctx: click.Context) -> None:
 @click.option("--baseline-in", type=click.Path(exists=True), help="Previous baseline for comparison")
 @click.option("--baseline-out", type=click.Path(), help="Save current scan as baseline")
 @click.option("--max-concurrent", default=10, type=int, help="Max concurrent LDAP queries")
+@click.option("--log-file", default="adsentinel.log", help="Path to audit log file")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def scan(
     server: str,
@@ -93,10 +94,11 @@ def scan(
     baseline_in: Optional[str],
     baseline_out: Optional[str],
     max_concurrent: int,
+    log_file: str,
     verbose: bool,
 ) -> None:
     """Run a security assessment scan against an Active Directory domain."""
-    configure_logging(verbose)
+    configure_logging(verbose, log_file=log_file)
 
     console.print(BANNER, style="bold cyan")
     console.print(f"  [bold]Target:[/bold] {domain} ({server})")
@@ -241,6 +243,7 @@ def checks_cmd(list_checks: bool, category: Optional[str]) -> None:
 @click.option("--auth", type=click.Choice(["simple", "ntlm", "kerberos", "certificate"]), default="simple", help="Authentication method")
 @click.option("--credential-file", type=click.Path(exists=True), help="YAML credential file path")
 @click.option("--no-winrm", is_flag=True, help="Skip WinRM connectivity test")
+@click.option("--log-file", default="adsentinel.log", help="Path to audit log file")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def preflight(
     server: str,
@@ -251,6 +254,7 @@ def preflight(
     auth: str,
     credential_file: Optional[str],
     no_winrm: bool,
+    log_file: str,
     verbose: bool,
 ) -> None:
     """Test connectivity and authentication before running a full scan.
@@ -260,7 +264,7 @@ def preflight(
     """
     import socket
 
-    configure_logging(verbose)
+    configure_logging(verbose, log_file=log_file)
 
     console.print(BANNER, style="bold cyan")
     console.print("  [bold]Preflight Check[/bold] — Verifying connectivity\n")
@@ -353,6 +357,7 @@ def preflight(
         console.print("  [bold]5. Object Access (sample user query)[/bold]")
         try:
             results = ldap.search(
+                search_base=config.base_dn,
                 search_filter="(&(objectClass=user)(objectCategory=person))",
                 attributes=["sAMAccountName"],
                 size_limit=3,
