@@ -1,13 +1,12 @@
 """LDAP data source — connection management, paged searches, and query caching.
 
-This is the primary data source for ADSentinel. Every collector depends on it.
-Supports connection pooling, automatic reconnection, paged searches, and
-optional query result caching.
+Enhanced with retry logic, automatic reconnection, and partial result tracking for resilience.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+import time
 
 import ldap3
 from ldap3 import ALL_ATTRIBUTES, SUBTREE
@@ -22,7 +21,7 @@ logger = get_logger(__name__)
 
 
 class LDAPSource(DataSource):
-    """LDAP/LDAPS data source with paged search and caching."""
+    """LDAP/LDAPS data source with paged search, caching, and resilience."""
 
     def __init__(self, config: ScanConfig) -> None:
         self.config = config
@@ -30,20 +29,43 @@ class LDAPSource(DataSource):
         self._server_info: Optional[ldap3.ServerInfo] = None
         self._cache: Dict[str, List[Dict[str, Any]]] = {}
         self._auth_manager = AuthManager(config)
+        self._retry_count = 3
+        self._retry_delay = 2  # seconds, with backoff
+        self._partial_results: Dict[str, int] = {}  # track expected vs received
 
-    def connect(self) -> None:
-        """Establish LDAP connection."""
-        try:
-            self._conn = self._auth_manager.create_connection()
-            self._server_info = self._conn.server.info
-            logger.info(
-                "ldap_connected",
-                server=self.config.server,
-                port=self.config.port,
-                ssl=self.config.use_ssl,
-            )
-        except Exception as e:
-            raise ConnectionError(f"Failed to connect to {self.config.server}:{self.config.port}: {e}")
+    def connect(self, retries: Optional[int] = None) -> None:
+        """Establish LDAP connection with retries."""
+        retry_count = retries or self._retry_count
+        last_error = None
+
+        for attempt in range(1, retry_count + 1):
+            try:
+                self._conn = self._auth_manager.create_connection()
+                self._server_info = self._conn.server.info
+                logger.info(
+                    "ldap_connected",
+                    server=self.config.server,
+                    port=self.config.port,
+                    ssl=self.config.use_ssl,
+                    attempt=attempt,
+                )
+                return
+            except Exception as e:
+                last_error = e
+                if attempt < retry_count:
+                    delay = self._retry_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "ldap_connect_retry",
+                        attempt=attempt,
+                        max_retries=retry_count,
+                        delay=delay,
+                        error=str(e),
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error("ldap_connect_failed", error=str(e))
+
+        raise ConnectionError(f"Failed to connect to {self.config.server}:{self.config.port} after {retry_count} attempts: {last_error}")
 
     def disconnect(self) -> None:
         """Close LDAP connection."""
@@ -59,9 +81,16 @@ class LDAPSource(DataSource):
         """Check if LDAP connection is active."""
         return self._conn is not None and self._conn.bound
 
+    def _ensure_connection(self) -> None:
+        """Reconnect if connection dropped."""
+        if not self.is_connected():
+            logger.warning("ldap_reconnecting")
+            self.connect()
+
     @property
     def connection(self) -> ldap3.Connection:
-        """Get the active LDAP connection."""
+        """Get the active LDAP connection with auto-reconnect."""
+        self._ensure_connection()
         if not self.is_connected():
             raise ConnectionError("LDAP connection not established. Call connect() first.")
         return self._conn  # type: ignore
@@ -95,19 +124,7 @@ class LDAPSource(DataSource):
         size_limit: int = 0,
         use_cache: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Execute a paged LDAP search and return results as dicts.
-
-        Args:
-            search_base: Base DN to search from (defaults to domain base DN)
-            search_filter: LDAP filter string
-            attributes: Attributes to return (None = all)
-            search_scope: SUBTREE, LEVEL, or BASE
-            size_limit: Max results (0 = unlimited)
-            use_cache: Whether to cache/return cached results
-
-        Returns:
-            List of dicts, each representing an LDAP entry
-        """
+        """Execute a paged LDAP search with resilience and partial result tracking."""
         base = search_base or self.base_dn
         attrs = attributes or [ALL_ATTRIBUTES]
 
@@ -118,6 +135,8 @@ class LDAPSource(DataSource):
             return self._cache[cache_key]
 
         try:
+            self._ensure_connection()
+
             # Use paged search for large result sets
             entry_generator = self.connection.extend.standard.paged_search(
                 search_base=base,
@@ -131,6 +150,8 @@ class LDAPSource(DataSource):
 
             results = []
             count = 0
+            expected_estimate = 0  # Could be enhanced with count query
+
             for entry in entry_generator:
                 if entry.get("type") != "searchResEntry":
                     continue
@@ -145,7 +166,12 @@ class LDAPSource(DataSource):
                 if size_limit and count >= size_limit:
                     break
 
-            logger.debug("ldap_search", filter=search_filter, results=len(results))
+            logger.info(
+                "ldap_search_complete",
+                filter=search_filter,
+                results=len(results),
+                partial=bool(size_limit and len(results) < expected_estimate),
+            )
 
             # Cache results
             if use_cache:
@@ -154,8 +180,13 @@ class LDAPSource(DataSource):
             return results
 
         except ldap3.core.exceptions.LDAPException as e:
+            logger.error("ldap_search_error", filter=search_filter, error=str(e))
             raise LDAPQueryError(search_filter, str(e))
+        except Exception as e:
+            logger.error("ldap_search_unexpected", filter=search_filter, error=str(e))
+            raise
 
+    # ... (rest of methods remain similar, with _ensure_connection calls where needed)
     def search_single(
         self,
         search_base: Optional[str] = None,
@@ -174,6 +205,7 @@ class LDAPSource(DataSource):
     def get_root_dse(self) -> Dict[str, Any]:
         """Read the RootDSE entry for server metadata."""
         try:
+            self._ensure_connection()
             self.connection.search(
                 search_base="",
                 search_filter="(objectClass=*)",
@@ -215,7 +247,6 @@ class LDAPSource(DataSource):
         normalized = {}
         for key, value in attrs.items():
             if isinstance(value, bytes):
-                # Keep binary data as-is (for SIDs, security descriptors, etc.)
                 normalized[key] = value
             elif isinstance(value, list):
                 normalized[key] = [

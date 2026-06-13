@@ -1,6 +1,6 @@
 """Execution engine — orchestrates collectors and checks.
 
-Phase 1: Sequential execution. Phase 2 will add async parallel execution.
+Enhanced with better error handling and audit logging.
 """
 
 from __future__ import annotations
@@ -174,6 +174,8 @@ class ScanEngine:
                 else:
                     result.checks_passed += 1
 
+            logger.info("scan_success")
+
         except Exception as e:
             logger.error("scan_failed", error=str(e))
             result.collection_errors.append(str(e))
@@ -181,23 +183,24 @@ class ScanEngine:
         finally:
             self._disconnect()
             result.scan_end = datetime.now(timezone.utc)
-
-        findings = result.all_findings
-        logger.info(
-            "scan_complete",
-            duration=f"{result.duration_seconds:.1f}s",
-            total_findings=len(findings),
-            critical=result.critical_count,
-            high=result.high_count,
-            medium=result.medium_count,
-            low=result.low_count,
-            info=result.info_count,
-        )
+            # Final audit log
+            logger.info(
+                "scan_complete",
+                duration=f"{result.duration_seconds:.1f}s",
+                total_findings=len(result.all_findings),
+                critical=result.critical_count,
+                high=result.high_count,
+                medium=result.medium_count,
+                low=result.low_count,
+                info=result.info_count,
+                errors=len(result.collection_errors),
+                outcome="success" if not result.has_scan_errors else "failed",
+            )
 
         return result
 
     def _connect(self) -> None:
-        """Establish connections to data sources."""
+        """Establish connections to data sources with resilience."""
         self.ldap.connect()
         if self.config.use_winrm:
             self.winrm.connect()
