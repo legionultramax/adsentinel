@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adsentinel"
-version = "1.0.0"
-description = "Elite Active Directory Security Assessment Tool — 200+ checks, attack path analysis, AD CS ESC1-13, async execution, and enterprise reporting"
+version = "1.3.0"
+description = "Elite Active Directory Security Assessment Tool — 152 checks, attack path analysis, AD CS ESC1-13, audit logging, LDAP resilience, and enterprise reporting"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
