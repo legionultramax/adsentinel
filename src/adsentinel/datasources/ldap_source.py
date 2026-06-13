@@ -5,7 +5,8 @@ Enhanced with retry logic, automatic reconnection, and partial result tracking f
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
 import time
 
 import ldap3
@@ -31,7 +32,6 @@ class LDAPSource(DataSource):
         self._auth_manager = AuthManager(config)
         self._retry_count = 3
         self._retry_delay = 2  # seconds, with backoff
-        self._partial_results: Dict[str, int] = {}  # track expected vs received
 
     def connect(self, retries: Optional[int] = None) -> None:
         """Establish LDAP connection with retries."""
@@ -105,16 +105,6 @@ class LDAPSource(DataSource):
         """Get the base DN from config."""
         return self.config.base_dn
 
-    @property
-    def config_dn(self) -> str:
-        """Get the configuration DN."""
-        return self.config.config_dn
-
-    @property
-    def schema_dn(self) -> str:
-        """Get the schema DN."""
-        return self.config.schema_dn
-
     def search(
         self,
         search_base: Optional[str] = None,
@@ -124,11 +114,10 @@ class LDAPSource(DataSource):
         size_limit: int = 0,
         use_cache: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Execute a paged LDAP search with resilience and partial result tracking."""
+        """Execute a paged LDAP search with modern ldap3 compatibility."""
         base = search_base or self.base_dn
         attrs = attributes or [ALL_ATTRIBUTES]
 
-        # Check cache
         cache_key = f"{base}|{search_filter}|{attrs}|{search_scope}"
         if use_cache and cache_key in self._cache:
             logger.debug("cache_hit", filter=search_filter)
@@ -137,20 +126,18 @@ class LDAPSource(DataSource):
         try:
             self._ensure_connection()
 
-            # Use paged search for large result sets
+            # Modern paged search (fixed for current ldap3 versions)
             entry_generator = self.connection.extend.standard.paged_search(
                 search_base=base,
                 search_filter=search_filter,
                 attributes=attrs,
                 search_scope=search_scope,
                 paged_size=self.config.page_size,
-                paged_cookie=None,
                 generator=True,
             )
 
             results = []
             count = 0
-            expected_estimate = 0  # Could be enhanced with count query
 
             for entry in entry_generator:
                 if entry.get("type") != "searchResEntry":
@@ -170,10 +157,8 @@ class LDAPSource(DataSource):
                 "ldap_search_complete",
                 filter=search_filter,
                 results=len(results),
-                partial=bool(size_limit and len(results) < expected_estimate),
             )
 
-            # Cache results
             if use_cache:
                 self._cache[cache_key] = results
 
@@ -186,7 +171,6 @@ class LDAPSource(DataSource):
             logger.error("ldap_search_unexpected", filter=search_filter, error=str(e))
             raise
 
-    # ... (rest of methods remain similar, with _ensure_connection calls where needed)
     def search_single(
         self,
         search_base: Optional[str] = None,
