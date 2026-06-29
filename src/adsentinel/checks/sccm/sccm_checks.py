@@ -58,7 +58,7 @@ class SCCM002_SCCMAdminGroup(BaseCheck):
             if any(kw in g.sam_account_name.lower() for kw in ["sccm", "configmgr", "mecm"])
             and g.is_security_group
         ]
-        large_sccm = [g for g in sccm_groups if len(g.member_dns) > 10]
+        large_sccm = [g for g in sccm_groups if len(g.member_dns) > 5]
         if large_sccm:
             return [self.finding(
                 title=f"{len(large_sccm)} SCCM admin groups have excessive membership",

@@ -109,12 +109,125 @@ class DomainInfoCollector(BaseCollector):
                 forest_dn = forest_dn[0] if forest_dn else ""
             info.forest_name = str(forest_dn)
 
+        # Fetch dsHeuristics — controls anonymous LDAP bind (position 7, '2' = allowed)
+        ds_dir_entry = self.ldap.search_single(
+            search_base=f"CN=Directory Service,CN=Windows NT,CN=Services,{self.ldap.config_dn}",
+            search_filter="(objectClass=*)",
+            attributes=["dsHeuristics"],
+        )
+        if ds_dir_entry is not None:
+            raw_dsh = ds_dir_entry.get("attributes", {}).get("dsHeuristics", None)
+            if isinstance(raw_dsh, list):
+                raw_dsh = raw_dsh[0] if raw_dsh else None
+            context.raw_entries["dsHeuristics"] = str(raw_dsh) if raw_dsh is not None else ""
+        # Key absent from raw_entries means the object was unreachable
+
         context.domain_info = info
+
+        # Collect AuthN Policy/Silo objects (requires FL >= 6 / 2012 R2)
+        if info.domain_functional_level >= 6:
+            self._collect_authn_policies(context, self.ldap.config_dn or f"CN=Configuration,{self.ldap.base_dn}")
+
         logger.info(
             "collected_domain_info",
             domain=info.dns_name,
             functional_level=info.domain_functional_level_name,
             dc_count=len(info.domain_controllers),
+        )
+
+    def _collect_authn_policies(self, context: SharedContext, config_dn: str) -> None:
+        """Collect Authentication Policy and Silo objects (Windows Server 2012 R2+)."""
+        authn_config_base = f"CN=AuthN Policy Configuration,CN=Services,{config_dn}"
+
+        # --- AuthN Policies ---
+        try:
+            policy_entries = self.ldap.search(
+                search_base=f"CN=AuthN Policies,{authn_config_base}",
+                search_filter="(objectClass=msDS-AuthNPolicy)",
+                attributes=["distinguishedName", "cn", "msDS-AuthNPolicyEnabled",
+                            "msDS-UserTGTLifetimeMins", "msDS-ServiceTGTLifetimeMins"],
+            )
+        except Exception:
+            policy_entries = []
+
+        policies = []
+        for entry in policy_entries:
+            attrs = entry.get("attributes", {})
+            enabled_raw = attrs.get("msDS-AuthNPolicyEnabled", False)
+            if isinstance(enabled_raw, list):
+                enabled_raw = enabled_raw[0] if enabled_raw else False
+            name_raw = attrs.get("cn", "")
+            if isinstance(name_raw, list):
+                name_raw = name_raw[0] if name_raw else ""
+            policies.append({
+                "dn": entry.get("dn", ""),
+                "name": str(name_raw),
+                "enabled": bool(enabled_raw),
+            })
+        context.raw_entries["authn_policies"] = policies
+
+        # --- AuthN Silos ---
+        try:
+            silo_entries = self.ldap.search(
+                search_base=f"CN=AuthN Silos,{authn_config_base}",
+                search_filter="(objectClass=msDS-AuthNPolicySilo)",
+                attributes=["distinguishedName", "cn", "msDS-AuthNPolicySiloEnabled",
+                            "msDS-AuthNPolicySiloMembers"],
+            )
+        except Exception:
+            silo_entries = []
+
+        silos = []
+        for entry in silo_entries:
+            attrs = entry.get("attributes", {})
+            enabled_raw = attrs.get("msDS-AuthNPolicySiloEnabled", False)
+            if isinstance(enabled_raw, list):
+                enabled_raw = enabled_raw[0] if enabled_raw else False
+            name_raw = attrs.get("cn", "")
+            if isinstance(name_raw, list):
+                name_raw = name_raw[0] if name_raw else ""
+            members_raw = attrs.get("msDS-AuthNPolicySiloMembers", [])
+            if not isinstance(members_raw, list):
+                members_raw = [members_raw] if members_raw else []
+            silos.append({
+                "dn": entry.get("dn", ""),
+                "name": str(name_raw),
+                "enabled": bool(enabled_raw),
+                "member_dns": [str(m) for m in members_raw if m],
+            })
+        context.raw_entries["authn_silos"] = silos
+
+        # --- Privileged users (adminCount=1) assigned to a silo ---
+        # We store assigned DNs so the check can compute coverage without a model change.
+        try:
+            assigned_entries = self.ldap.search(
+                search_filter=and_filter([
+                    eq("objectClass", "user"),
+                    eq("adminCount", "1"),
+                    "(msDS-AssignedAuthNPolicySilo=*)",
+                ]),
+                attributes=["distinguishedName", "msDS-AssignedAuthNPolicySilo"],
+            )
+        except Exception:
+            assigned_entries = []
+
+        assigned_silos = []
+        for entry in assigned_entries:
+            attrs = entry.get("attributes", {})
+            silo_dn = attrs.get("msDS-AssignedAuthNPolicySilo", "")
+            if isinstance(silo_dn, list):
+                silo_dn = silo_dn[0] if silo_dn else ""
+            assigned_silos.append({
+                "dn": entry.get("dn", ""),
+                "assigned_silo": str(silo_dn),
+            })
+        context.raw_entries["authn_silo_members"] = assigned_silos
+
+        logger.info(
+            "collected_authn_policies",
+            policy_count=len(policies),
+            silo_count=len(silos),
+            assigned_count=len(assigned_silos),
         )
 
     def _get_str(self, attrs: dict, key: str) -> str:

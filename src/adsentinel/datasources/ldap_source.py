@@ -105,6 +105,16 @@ class LDAPSource(DataSource):
         """Get the base DN from config."""
         return self.config.base_dn
 
+    @property
+    def config_dn(self) -> str:
+        """Get the Configuration naming context DN."""
+        return f"CN=Configuration,{self.base_dn}"
+
+    @property
+    def schema_dn(self) -> str:
+        """Get the Schema naming context DN."""
+        return f"CN=Schema,{self.config_dn}"
+
     def search(
         self,
         search_base: Optional[str] = None,

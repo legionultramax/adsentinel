@@ -5,6 +5,13 @@ from __future__ import annotations
 from typing import List
 
 from adsentinel.checks.base import BaseCheck, check
+from adsentinel.collectors.acl_collector import (
+    GENERIC_ALL,
+    GENERIC_WRITE,
+    WRITE_DACL,
+    WRITE_OWNER,
+    build_safe_sids,
+)
 from adsentinel.constants import (
     EKU_ANY_PURPOSE,
     EKU_CERTIFICATE_REQUEST_AGENT,
@@ -131,52 +138,142 @@ class ADCS003_ESC3(BaseCheck):
 class ADCS004_ESC4(BaseCheck):
     id = "ADCS-004"
     name = "ESC4 — Template ACL Allows Modification"
-    description = "Check if non-admin users can modify certificate template attributes"
+    description = "Non-admin SIDs with write/full-control on certificate template objects"
     category = "AD Certificate Services"
 
+    _DANGEROUS = WRITE_DACL | WRITE_OWNER | GENERIC_ALL | GENERIC_WRITE
+
     def run(self) -> List[Finding]:
-        # ESC4 requires ACL analysis on templates — flag as info if templates exist
-        if self.context.certificate_templates:
-            return [self.finding(
-                title=f"ESC4: {len(self.context.certificate_templates)} certificate templates — verify ACLs",
-                description=(
-                    "ESC4 occurs when non-privileged users have write access to certificate template objects. "
-                    "An attacker could modify a template to enable ESC1/ESC2 conditions. "
-                    "Full ACL analysis on template objects is recommended."
-                ),
-                severity=Severity.INFO,
-                affected_count=len(self.context.certificate_templates),
-                remediation_desc="Audit certificate template ACLs. Only CA Admins and Enterprise Admins should have write access.",
-                powershell="foreach ($t in (Get-ADObject -SearchBase 'CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=com' -Filter *)) { (Get-ACL \"AD:\\$($t.DistinguishedName)\").Access | Where-Object {$_.ActiveDirectoryRights -match 'Write'} }",
-                mitre=_MITRE_ADCS,
-                nist_800_53=["AC-6"],
-            )]
-        return []
+        safe_sids = build_safe_sids(self.context.domain_info.domain_sid or "")
+        vuln: list = []
+
+        for t in self.context.certificate_templates:
+            dn = t.get("dn", "")
+            acl_data = self.context.acls.get(f"pki_template:{dn}", {})
+            if acl_data.get("parse_error") and not acl_data.get("aces"):
+                continue  # ACL not available for this template
+
+            bad_sids = [
+                ace["sid"]
+                for ace in acl_data.get("aces", [])
+                if ace.get("allowed")
+                and ace.get("sid") not in safe_sids
+                and (ace.get("mask", 0) & self._DANGEROUS)
+            ]
+            if bad_sids:
+                vuln.append({"name": t.get("name", dn), "dn": dn, "sids": bad_sids})
+
+        if not vuln:
+            return []
+
+        return [self.finding(
+            title=f"ESC4: {len(vuln)} template{'s have' if len(vuln) != 1 else ' has'} dangerous write permissions",
+            description=(
+                f"{len(vuln)} certificate template{'s' if len(vuln) != 1 else ''} "
+                "grant non-administrative principals WriteDACL, WriteOwner, GenericAll, or GenericWrite. "
+                "An attacker with these rights can reconfigure the template (enable enrollee-supplied SAN, "
+                "add client auth EKU, remove manager approval) to create an ESC1 condition, then "
+                "request a certificate as any domain user including Domain Admin."
+            ),
+            severity=Severity.CRITICAL,
+            affected_objects=[
+                AffectedObject(dn=v["dn"], sam_account_name=v["name"], object_type="certificate_template")
+                for v in vuln
+            ],
+            affected_count=len(vuln),
+            remediation_desc=(
+                "Remove write/full-control ACEs for non-admin accounts on these templates. "
+                "Only Domain Admins, Enterprise Admins, and designated CA Admins should have write access."
+            ),
+            powershell=(
+                "# Inspect template ACLs:\n"
+                "foreach ($t in (Get-ADObject -SearchBase "
+                "'CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=com' "
+                "-Filter * -Properties nTSecurityDescriptor)) {\n"
+                "    (Get-ACL \"AD:\\$($t.DistinguishedName)\").Access | "
+                "Where-Object {$_.ActiveDirectoryRights -match 'Write|FullControl'} | "
+                "Select-Object IdentityReference,ActiveDirectoryRights\n}"
+            ),
+            mitre=_MITRE_ADCS,
+            nist_800_53=["AC-6"],
+            details={"vulnerable_templates": [{"name": v["name"], "bad_sids": v["sids"]} for v in vuln]},
+        )]
 
 
 @check
 class ADCS005_ESC5(BaseCheck):
     id = "ADCS-005"
     name = "ESC5 — PKI Object ACL Abuse"
-    description = "Check CA and PKI container ACL security"
+    description = "Non-admin write rights on enrollment service and CA objects in CN=Public Key Services"
     category = "AD Certificate Services"
 
+    _DANGEROUS = WRITE_DACL | WRITE_OWNER | GENERIC_ALL | GENERIC_WRITE
+
     def run(self) -> List[Finding]:
-        if self.context.certificate_authorities:
-            return [self.finding(
-                title=f"ESC5: {len(self.context.certificate_authorities)} CAs found — verify PKI object ACLs",
-                description=(
-                    "ESC5 targets CA server objects, enrollment service objects, and the NTAuth store. "
-                    "Compromising these objects can enable certificate forgery. "
-                    "Review ACLs on all objects in CN=Public Key Services."
-                ),
-                severity=Severity.INFO,
-                affected_count=len(self.context.certificate_authorities),
-                remediation_desc="Restrict write access on PKI objects to CA Admins and Enterprise Admins only.",
-                mitre=_MITRE_ADCS,
-                nist_800_53=["AC-6"],
-            )]
-        return []
+        safe_sids = build_safe_sids(self.context.domain_info.domain_sid or "")
+        vuln: list = []
+
+        # Check enrollment service and CA objects — these are the ESC5 targets
+        pki_objects = (
+            [("pki_enrollment", es) for es in self.context.enrollment_services]
+            + [("pki_ca", ca) for ca in self.context.certificate_authorities]
+        )
+        for prefix, obj in pki_objects:
+            dn = obj.get("dn", "")
+            acl_data = self.context.acls.get(f"{prefix}:{dn}", {})
+            if acl_data.get("parse_error") and not acl_data.get("aces"):
+                continue
+
+            bad_sids = [
+                ace["sid"]
+                for ace in acl_data.get("aces", [])
+                if ace.get("allowed")
+                and ace.get("sid") not in safe_sids
+                and (ace.get("mask", 0) & self._DANGEROUS)
+            ]
+            if bad_sids:
+                vuln.append({
+                    "name": obj.get("name", dn),
+                    "dn": dn,
+                    "type": "enrollment_service" if prefix == "pki_enrollment" else "ca",
+                    "sids": bad_sids,
+                })
+
+        if not vuln:
+            return []
+
+        return [self.finding(
+            title=f"ESC5: {len(vuln)} PKI object{'s have' if len(vuln) != 1 else ' has'} dangerous write permissions",
+            description=(
+                f"{len(vuln)} PKI object{'s' if len(vuln) != 1 else ''} "
+                "(enrollment services or CA objects) grant non-administrative principals "
+                "WriteDACL, WriteOwner, GenericAll, or GenericWrite. "
+                "Control over a CA object lets an attacker modify its templates list, enable "
+                "EDITF_ATTRIBUTESUBJECTALTNAME2, or configure new enrollment paths — any of which "
+                "leads to arbitrary certificate issuance and domain compromise."
+            ),
+            severity=Severity.CRITICAL,
+            affected_objects=[
+                AffectedObject(dn=v["dn"], sam_account_name=v["name"], object_type=v["type"])
+                for v in vuln
+            ],
+            affected_count=len(vuln),
+            remediation_desc=(
+                "Remove write/full-control ACEs on enrollment service and CA objects for non-admin accounts. "
+                "Only Enterprise Admins and designated CA Admins should have write access to PKI container objects."
+            ),
+            powershell=(
+                "# Inspect enrollment service ACLs:\n"
+                "Get-ADObject -SearchBase "
+                "'CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=com' "
+                "-Filter * | ForEach-Object { "
+                "(Get-ACL \"AD:\\$($_.DistinguishedName)\").Access | "
+                "Where-Object {$_.ActiveDirectoryRights -match 'Write|FullControl'} }"
+            ),
+            mitre=_MITRE_ADCS,
+            nist_800_53=["AC-6"],
+            details={"vulnerable_pki_objects": [{"name": v["name"], "type": v["type"], "bad_sids": v["sids"]} for v in vuln]},
+        )]
 
 
 @check
@@ -216,27 +313,52 @@ class ADCS006_ESC6(BaseCheck):
 class ADCS007_ESC7(BaseCheck):
     id = "ADCS-007"
     name = "ESC7 — CA Manager/Officer Permissions"
-    description = "Check for dangerous CA manager approvals"
+    description = "ManageCA / ManageCertificates rights grant CA-level control; cannot be read via LDAP"
     category = "AD Certificate Services"
 
     def run(self) -> List[Finding]:
-        # ESC7 requires checking who has ManageCA / ManageCertificates rights
-        if self.context.enrollment_services:
-            return [self.finding(
-                title=f"ESC7: Verify CA Manager/Officer permissions on {len(self.context.enrollment_services)} enrollment services",
-                description=(
-                    "ESC7 allows users with ManageCA permission to enable EDITF_ATTRIBUTESUBJECTALTNAME2, "
-                    "or users with ManageCertificates to approve pending requests. "
-                    "Audit who holds these rights."
-                ),
-                severity=Severity.MEDIUM,
-                affected_count=len(self.context.enrollment_services),
-                remediation_desc="Restrict ManageCA and ManageCertificates permissions to CA administrators only.",
-                powershell="certutil -config \"CA_NAME\" -getacl",
-                mitre=_MITRE_ADCS,
-                nist_800_53=["AC-6"],
-            )]
-        return []
+        if not self.context.enrollment_services:
+            return []
+
+        # ESC7 exploits ManageCA and ManageCertificates CA roles:
+        #   ManageCA     → can enable EDITF_ATTRIBUTESUBJECTALTNAME2 (= ESC6) on the CA
+        #   ManageCerts  → can approve any pending certificate request
+        # These roles are stored in the CA's own database (certutil -getacl), NOT in LDAP.
+        # nTSecurityDescriptor on the enrollment service object controls object-level AD rights
+        # (covered by ADCS-005), not CA operational roles.
+        # This check fires as a MEDIUM advisory whenever CAs are deployed — operators must
+        # verify CA roles manually. See ADCS-005 for LDAP-readable write rights.
+        es_names = [es.get("name", es.get("dn", "?")) for es in self.context.enrollment_services]
+        return [self.finding(
+            title=f"ESC7: CA role audit required on {len(self.context.enrollment_services)} enrollment service{'s' if len(self.context.enrollment_services) != 1 else ''}",
+            description=(
+                "ManageCA and ManageCertificates are CA-internal roles that cannot be read via LDAP. "
+                "ManageCA lets a holder enable EDITF_ATTRIBUTESUBJECTALTNAME2 (turning all templates "
+                "into ESC6 targets). ManageCertificates lets a holder approve any pending request, "
+                "bypassing manager-approval controls. These roles must be audited with certutil or "
+                "the CA MMC snap-in — they are not reflected in the enrollment service's AD DACL. "
+                "Ensure only designated CA administrators hold these roles."
+            ),
+            severity=Severity.MEDIUM,
+            affected_objects=[
+                AffectedObject(dn=es.get("dn", ""), sam_account_name=es.get("name", ""), object_type="enrollment_service")
+                for es in self.context.enrollment_services
+            ],
+            affected_count=len(self.context.enrollment_services),
+            remediation_desc=(
+                "On each CA: run 'certutil -config <CA> -getacl' and verify only named CA admin "
+                "accounts hold ManageCA and ManageCertificates roles. Remove any unexpected accounts."
+            ),
+            powershell=(
+                "# List CA roles (run on each CA host):\n"
+                "certutil -config \"<CA_HOST>\\<CA_NAME>\" -getacl\n\n"
+                "# Or via MMC:\n"
+                "# certsrv.msc → right-click CA → Properties → Security tab"
+            ),
+            mitre=_MITRE_ADCS,
+            nist_800_53=["AC-6"],
+            details={"enrollment_services": es_names},
+        )]
 
 
 @check
@@ -337,28 +459,52 @@ class ADCS010_ESC10(BaseCheck):
 class ADCS011_ESC11(BaseCheck):
     id = "ADCS-011"
     name = "ESC11 — NTLM Relay to ICPR (RPC)"
-    description = "CA allows NTLM authentication for certificate enrollment over RPC"
+    description = "CA RPC enrollment interface may allow NTLM relay if IF_ENFORCEENCRYPTICERTREQUEST is not set"
     category = "AD Certificate Services"
-    requires_winrm = True
+    # IF_ENFORCEENCRYPTICERTREQUEST lives in CA registry (CertSvc\Configuration\<CAName>\InterfaceFlags)
+    # — not in LDAP. WinRM collection would need the CA name at collection time, which is unavailable.
+    # This check fires as a MEDIUM advisory whenever CAs are deployed.
 
     def run(self) -> List[Finding]:
-        # IF_ENFORCEENCRYPTICERTREQUEST not set = NTLM relay possible over RPC
-        if self.context.enrollment_services:
-            return [self.finding(
-                title=f"ESC11: Verify NTLM relay protection on {len(self.context.enrollment_services)} CAs",
-                description=(
-                    "ESC11 enables NTLM relay to the CA's RPC-based certificate enrollment interface (ICPR). "
-                    "If the CA does not enforce encrypted ICPR requests, attackers can relay NTLM authentication "
-                    "to request certificates."
-                ),
-                severity=Severity.MEDIUM,
-                affected_count=len(self.context.enrollment_services),
-                remediation_desc="Enable IF_ENFORCEENCRYPTICERTREQUEST on the CA.",
-                powershell="certutil -config \"CA_NAME\" -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST",
-                mitre=_MITRE_ADCS,
-                nist_800_53=["SC-8"],
-            )]
-        return []
+        if not self.context.enrollment_services:
+            return []
+
+        es_names = [es.get("name", es.get("dn", "?")) for es in self.context.enrollment_services]
+        return [self.finding(
+            title=f"ESC11: Verify IF_ENFORCEENCRYPTICERTREQUEST on {len(self.context.enrollment_services)} CA{'s' if len(self.context.enrollment_services) != 1 else ''}",
+            description=(
+                "ESC11 exploits the CA's RPC-based enrollment interface (ICPR). "
+                "If IF_ENFORCEENCRYPTICERTREQUEST is not set in the CA's InterfaceFlags, "
+                "the ICPR endpoint accepts NTLM-authenticated enrollment requests without "
+                "message encryption. An attacker can relay NTLM authentication (e.g., via "
+                "PetitPotam or PrinterBug coercion) to the ICPR endpoint and obtain a "
+                "certificate as the coerced machine account. "
+                "The InterfaceFlags value is stored in the CA registry — it cannot be "
+                "read remotely via LDAP. Verify it manually with certutil on each CA host."
+            ),
+            severity=Severity.MEDIUM,
+            affected_objects=[
+                AffectedObject(dn=es.get("dn", ""), sam_account_name=es.get("name", ""), object_type="enrollment_service")
+                for es in self.context.enrollment_services
+            ],
+            affected_count=len(self.context.enrollment_services),
+            remediation_desc=(
+                "On each CA host, enable encrypted ICPR requests:\n"
+                "  certutil -config '<host>\\<CA>' -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST\n"
+                "  net stop certsvc && net start certsvc\n"
+                "Also consider disabling NTLM on DCs to remove the relay precondition."
+            ),
+            powershell=(
+                "# Check current InterfaceFlags (run on CA host):\n"
+                "certutil -config \"<CA_HOST>\\<CA_NAME>\" -getreg CA\\InterfaceFlags\n\n"
+                "# Enable enforcement:\n"
+                "certutil -config \"<CA_HOST>\\<CA_NAME>\" -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST\n"
+                "Restart-Service CertSvc"
+            ),
+            mitre=_MITRE_ADCS,
+            nist_800_53=["SC-8"],
+            details={"enrollment_services": es_names},
+        )]
 
 
 @check
@@ -430,10 +576,14 @@ class ADCS014_TemplateCount(BaseCheck):
 
     def run(self) -> List[Finding]:
         count = len(self.context.certificate_templates)
-        if count > 50:
+        if count > 20:
             return [self.finding(
-                title=f"{count} certificate templates found — large attack surface",
-                description="Each template is a potential misconfiguration point. Organizations should minimize the number of published templates.",
+                title=f"{count} certificate templates published — large AD CS attack surface",
+                description=(
+                    f"{count} certificate templates are published. Windows ships with ~32 built-in templates; "
+                    "anything above that represents custom additions. Every published template is a potential "
+                    "ESC1–ESC11 misconfiguration surface. Organisations should publish only templates in active use."
+                ),
                 severity=Severity.LOW,
                 affected_count=count,
                 remediation_desc="Review and unpublish unnecessary certificate templates.",
@@ -441,3 +591,179 @@ class ADCS014_TemplateCount(BaseCheck):
                 nist_800_53=["CM-6"],
             )]
         return []
+
+
+@check
+class ADCS015_ESC12(BaseCheck):
+    id = "ADCS-015"
+    name = "ESC12 — Private Key Archival Enabled"
+    description = (
+        "Detect CA key archival configuration via two LDAP signals: "
+        "(1) msPKI-RA-Certificate on enrollment service objects — the CA holds KRA certificates "
+        "and can decrypt archived private keys; "
+        "(2) CT_FLAG_REQUIRE_PRIVATE_KEY_ARCHIVAL in msPKI-Private-Key-Flag on templates — "
+        "enrollment for these templates sends the private key to the CA for escrow."
+    )
+    category = "AD Certificate Services"
+
+    def run(self) -> List[Finding]:
+        # Signal 1: enrollment services with KRA certificates configured
+        kra_cas = [
+            es for es in self.context.enrollment_services
+            if es.get("has_kra_certificates")
+        ]
+
+        # Signal 2: templates requiring private key archival
+        archival_templates = [
+            t for t in self.context.certificate_templates
+            if t.get("requires_key_archival")
+        ]
+
+        if not kra_cas and not archival_templates:
+            return []
+
+        findings = []
+
+        if kra_cas:
+            ca_lines = "\n".join(
+                f"  • {es.get('name', es.get('dn', '?'))} "
+                f"({es.get('kra_cert_count', '?')} KRA certificate(s))"
+                for es in kra_cas
+            )
+            findings.append(self.finding(
+                title=(
+                    f"ESC12: {len(kra_cas)} CA(s) have Key Recovery Agent (KRA) certificates "
+                    "configured — private key archival is active"
+                ),
+                description=(
+                    "The following CAs have msPKI-RA-Certificate populated, meaning they hold "
+                    "Key Recovery Agent (KRA) certificates and are configured to archive client "
+                    "private keys. Any CA admin or KRA certificate holder can use certutil -recoverkey "
+                    "to decrypt and export any archived private key issued by these CAs.\n\n"
+                    "If any archived certificate was used for client authentication, S/MIME, or "
+                    "code signing, the corresponding private key is now recoverable by the CA admin "
+                    "— enabling impersonation of any user who enrolled under an archival-required template.\n\n"
+                    "Affected CAs:\n" + ca_lines
+                ),
+                severity=Severity.HIGH,
+                affected_objects=[
+                    AffectedObject(
+                        dn=es["dn"],
+                        sam_account_name=es.get("name", ""),
+                        object_type="enrollment_service",
+                        details={"kra_cert_count": es.get("kra_cert_count", 0)},
+                    )
+                    for es in kra_cas
+                ],
+                affected_count=len(kra_cas),
+                remediation_desc=(
+                    "1. Determine if key archival is intentionally configured — it is required for "
+                    "some smart card and S/MIME deployments. "
+                    "2. If unintentional, remove the KRA certificates from the CA: "
+                    "certutil -config <CA> -setcacertificate <cert_index> -delete. "
+                    "3. Restrict KRA role to dedicated, highly-privileged accounts — treat KRA cert "
+                    "holders as Tier 0 since they can recover authentication credentials. "
+                    "4. Audit who holds the KRA certificate's private key."
+                ),
+                powershell=(
+                    "# Check KRA certificates on each CA:\n"
+                    "$configDN = (Get-ADRootDSE).configurationNamingContext\n"
+                    "Get-ADObject -SearchBase "
+                    "\"CN=Enrollment Services,CN=Public Key Services,CN=Services,$configDN\" "
+                    "-Filter * -Properties 'msPKI-RA-Certificate' | "
+                    "Select-Object Name, @{N='KRACerts';E={$_.'msPKI-RA-Certificate'.Count}}\n\n"
+                    "# List archived keys on a CA (run on CA host):\n"
+                    "certutil -config \"<CA_HOST>\\<CA_NAME>\" -getkey"
+                ),
+                mitre=_MITRE_ADCS,
+                nist_800_53=["SC-17", "IA-5"],
+                details={
+                    "kra_cas": [
+                        {"name": es.get("name"), "dn": es["dn"], "kra_cert_count": es.get("kra_cert_count", 0)}
+                        for es in kra_cas
+                    ],
+                },
+            ))
+
+        if archival_templates:
+            auth_archival = [
+                t for t in archival_templates
+                if t.get("allows_client_auth")
+            ]
+            severity = Severity.CRITICAL if auth_archival else Severity.HIGH
+            template_lines = "\n".join(
+                f"  • {t.get('name', t.get('dn', '?'))}"
+                + (" [client auth EKU]" if t.get("allows_client_auth") else "")
+                for t in archival_templates[:20]
+            )
+            findings.append(self.finding(
+                title=(
+                    f"ESC12: {len(archival_templates)} template(s) require private key archival"
+                    + (f" — {len(auth_archival)} include client auth EKU" if auth_archival else "")
+                ),
+                description=(
+                    "These certificate templates have CT_FLAG_REQUIRE_PRIVATE_KEY_ARCHIVAL set "
+                    "in msPKI-Private-Key-Flag. When a user enrolls for one of these templates, "
+                    "their private key is encrypted with the CA's KRA public key and stored in "
+                    "the CA database. The CA admin (or any KRA certificate holder) can later "
+                    "recover the private key using certutil -recoverkey.\n\n"
+                    + (
+                        f"{len(auth_archival)} of these templates also have a client authentication "
+                        "EKU — meaning the archived keys can be used to impersonate the certificate "
+                        "holder for domain authentication (PKINIT, Schannel). A CA admin who "
+                        "recovers an archived authentication cert can authenticate as that user "
+                        "without needing their password.\n\n"
+                        if auth_archival else ""
+                    ) +
+                    "Affected templates:\n" + template_lines +
+                    ("\n  (and more...)" if len(archival_templates) > 20 else "")
+                ),
+                severity=severity,
+                affected_objects=[
+                    AffectedObject(
+                        dn=t["dn"],
+                        sam_account_name=t.get("name", ""),
+                        object_type="certificate_template",
+                        details={
+                            "allows_client_auth": t.get("allows_client_auth", False),
+                            "private_key_flag": hex(t.get("private_key_flag", 0)),
+                        },
+                    )
+                    for t in archival_templates[:50]
+                ],
+                affected_count=len(archival_templates),
+                remediation_desc=(
+                    "1. Evaluate whether key archival is required for each template's use case. "
+                    "2. If not required, remove CT_FLAG_REQUIRE_PRIVATE_KEY_ARCHIVAL from "
+                    "msPKI-Private-Key-Flag on the template. "
+                    "3. For authentication templates especially, disable key archival — "
+                    "private keys used for PKINIT should never leave the client. "
+                    "4. If archival must remain (e.g., for S/MIME or encryption), apply strict "
+                    "access controls on the CA database and KRA certificate."
+                ),
+                powershell=(
+                    "# Find templates with key archival required:\n"
+                    "$configDN = (Get-ADRootDSE).configurationNamingContext\n"
+                    "Get-ADObject -SearchBase "
+                    "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN\" "
+                    "-Filter * -Properties 'msPKI-Private-Key-Flag' | "
+                    "Where-Object { $_.'msPKI-Private-Key-Flag' -band 0x10 } | "
+                    "Select-Object Name, 'msPKI-Private-Key-Flag'\n\n"
+                    "# Disable key archival on a template (hex 0x10 = 16):\n"
+                    "$t = Get-ADObject -Identity '<template DN>' -Properties 'msPKI-Private-Key-Flag'\n"
+                    "Set-ADObject $t -Replace @{'msPKI-Private-Key-Flag' = "
+                    "($t.'msPKI-Private-Key-Flag' -band (-bnot 0x10))}"
+                ),
+                mitre=_MITRE_ADCS,
+                nist_800_53=["SC-17", "IA-5"],
+                details={
+                    "archival_template_count": len(archival_templates),
+                    "auth_archival_count": len(auth_archival),
+                    "templates": [
+                        {"name": t.get("name"), "allows_client_auth": t.get("allows_client_auth", False)}
+                        for t in archival_templates
+                    ],
+                },
+            ))
+
+        return findings

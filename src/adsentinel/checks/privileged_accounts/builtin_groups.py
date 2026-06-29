@@ -32,12 +32,14 @@ class PA001_DomainAdminCount(BaseCheck):
 
     def run(self) -> List[Finding]:
         da_members = self._get_group_members_by_rid(RID_DOMAIN_ADMINS)
-        if len(da_members) > 5:
+        if len(da_members) > 3:
             return [self.finding(
                 title=f"Excessive Domain Admin membership ({len(da_members)} members)",
                 description=(
                     f"The Domain Admins group has {len(da_members)} members. "
-                    "Each Domain Admin is a high-value target. Minimize membership to reduce attack surface."
+                    "Best practice is ≤ 3 named individuals (break-glass accounts only). "
+                    "Each Domain Admin is a Tier 0 target — credential theft or compromise of any member "
+                    "yields full domain control."
                 ),
                 severity=Severity.HIGH,
                 affected_objects=[self.affected_user(u) for u in da_members[:50]],
@@ -465,3 +467,161 @@ class PA015_StaleDCs(BaseCheck):
                 nist_800_53=["SI-2", "CM-6"],
             )]
         return []
+
+
+@check
+class PA016_NeverLoggedOnPrivileged(BaseCheck):
+    id = "PA-016"
+    name = "Never-Logged-On Privileged Accounts"
+    description = (
+        "Detect enabled privileged accounts (adminCount=1) that have never authenticated — "
+        "the highest-confidence indicator of backdoor or forgotten accounts."
+    )
+    category = "Privileged Accounts"
+
+    # RIDs whose group membership escalates severity to CRITICAL (tier-0 groups)
+    _TIER0_RIDS = {RID_DOMAIN_ADMINS, RID_ENTERPRISE_ADMINS, RID_SCHEMA_ADMINS}
+
+    # Exclude built-in accounts that legitimately may never log on interactively
+    # RID 500 = built-in Administrator, RID 502 = krbtgt
+    _EXCLUDE_RIDS = {500, 502}
+
+    def run(self) -> List[Finding]:
+        never_logon_admins = [
+            u for u in self.context.users
+            if u.enabled
+            and u.admin_count == 1
+            and u.last_logon is None
+            and get_rid(u.sid) not in self._EXCLUDE_RIDS
+        ]
+
+        if not never_logon_admins:
+            return []
+
+        # Separate tier-0 members (CRITICAL) from other privileged accounts (HIGH)
+        tier0_dns: set = set()
+        for group in self.context.groups:
+            if group.sid and get_rid(group.sid) in self._TIER0_RIDS:
+                tier0_dns.update(group.member_dns)
+
+        tier0_accounts = [u for u in never_logon_admins if u.dn in tier0_dns]
+        other_accounts = [u for u in never_logon_admins if u.dn not in tier0_dns]
+
+        findings: List[Finding] = []
+
+        if tier0_accounts:
+            created_details = {
+                u.sam_account_name: (
+                    f"created {days_since(u.when_created)} days ago, never used"
+                    if u.when_created else "creation date unknown, never used"
+                )
+                for u in tier0_accounts
+            }
+            findings.append(self.finding(
+                title=(
+                    f"{len(tier0_accounts)} tier-0 privileged account(s) have NEVER logged on "
+                    "(Domain Admins / Enterprise Admins / Schema Admins)"
+                ),
+                description=(
+                    "These accounts are members of Domain Admins, Enterprise Admins, or Schema Admins "
+                    "and have NEVER authenticated to any domain controller. "
+                    "A never-used privileged account is the clearest possible signal of a backdoor account, "
+                    "a credential left by an installer, or an account forgotten after a migration. "
+                    "Because adminCount=1 is set, AdminSDHolder protects the DACL — the account persists "
+                    "even if removed from groups until adminCount is cleared. "
+                    "Attackers routinely create silent admin accounts and wait months before using them.\n\n"
+                    "Accounts:\n" + "\n".join(
+                        f"  • {u.sam_account_name} — {created_details[u.sam_account_name]}"
+                        for u in tier0_accounts
+                    )
+                ),
+                severity=Severity.CRITICAL,
+                affected_objects=[self.affected_user(u) for u in tier0_accounts],
+                affected_count=len(tier0_accounts),
+                remediation_desc=(
+                    "1. Verify each account's business purpose with the account owner. "
+                    "2. If no legitimate owner exists, disable immediately and move to a quarantine OU. "
+                    "3. After 30 days with no business justification, delete the account. "
+                    "4. Clear adminCount and re-enable ACL inheritance before deletion. "
+                    "5. Investigate the account's creation (Event ID 4720) for attribution."
+                ),
+                powershell=(
+                    "# Find all never-logged-on privileged accounts:\n"
+                    "Get-ADUser -Filter {adminCount -eq 1 -and Enabled -eq $true} "
+                    "-Properties lastLogonTimestamp, whenCreated, adminCount, memberOf | "
+                    "Where-Object { $_.lastLogonTimestamp -eq $null -or $_.lastLogonTimestamp -eq 0 } | "
+                    "Select-Object SamAccountName, whenCreated, @{N='MemberOf';E={($_.memberOf -join ', ')}}"
+                ),
+                mitre=[
+                    MitreAttack(
+                        technique_id="T1136.002",
+                        technique_name="Create Account: Domain Account",
+                        tactic="Persistence",
+                    ),
+                    MitreAttack(
+                        technique_id=MITRE_ACCOUNT_MANIPULATION,
+                        technique_name="Account Manipulation",
+                        tactic="Persistence",
+                    ),
+                ],
+                cis_controls=["5.3", "5.4"],
+                nist_800_53=["AC-2", "AC-6", "AU-12"],
+                details={
+                    "tier0_never_logon_count": len(tier0_accounts),
+                    "accounts": created_details,
+                },
+            ))
+
+        if other_accounts:
+            created_details_other = {
+                u.sam_account_name: (
+                    f"created {days_since(u.when_created)} days ago, never used"
+                    if u.when_created else "creation date unknown, never used"
+                )
+                for u in other_accounts
+            }
+            findings.append(self.finding(
+                title=(
+                    f"{len(other_accounts)} privileged account(s) with adminCount=1 have NEVER logged on"
+                ),
+                description=(
+                    "These accounts have adminCount=1 (protected by AdminSDHolder) and have never "
+                    "authenticated to any domain controller. While not in tier-0 groups, they still "
+                    "hold elevated privileges and represent an unnecessary attack surface.\n\n"
+                    "Common causes: service accounts created but never activated, accounts from failed "
+                    "migrations, or deliberately planted backdoor accounts.\n\n"
+                    "Accounts:\n" + "\n".join(
+                        f"  • {u.sam_account_name} — {created_details_other[u.sam_account_name]}"
+                        for u in other_accounts[:30]
+                    ) + (
+                        f"\n  ... and {len(other_accounts) - 30} more"
+                        if len(other_accounts) > 30 else ""
+                    )
+                ),
+                severity=Severity.HIGH,
+                affected_objects=[self.affected_user(u) for u in other_accounts[:50]],
+                affected_count=len(other_accounts),
+                remediation_desc=(
+                    "Review each account's business purpose. Disable accounts with no active owner. "
+                    "Clear adminCount and re-enable ACL inheritance before deleting."
+                ),
+                powershell=(
+                    "Get-ADUser -Filter {adminCount -eq 1 -and Enabled -eq $true} "
+                    "-Properties lastLogonTimestamp, whenCreated | "
+                    "Where-Object { $_.lastLogonTimestamp -eq $null -or $_.lastLogonTimestamp -eq 0 } | "
+                    "Select-Object SamAccountName, whenCreated | Sort-Object whenCreated"
+                ),
+                mitre=[MitreAttack(
+                    technique_id="T1136.002",
+                    technique_name="Create Account: Domain Account",
+                    tactic="Persistence",
+                )],
+                cis_controls=["5.3"],
+                nist_800_53=["AC-2", "AC-6"],
+                details={
+                    "privileged_never_logon_count": len(other_accounts),
+                    "accounts": created_details_other,
+                },
+            ))
+
+        return findings

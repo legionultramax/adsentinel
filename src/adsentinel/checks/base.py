@@ -44,11 +44,30 @@ class BaseCheck(ABC):
     def execute(self) -> CheckResult:
         """Execute the check with error handling and timing."""
         if self.requires_winrm and not self.context.has_winrm_data:
-            logger.debug("check_skipped_no_winrm", check_id=self.id)
+            logger.warning("check_skipped_no_winrm", check_id=self.id, check_name=self.name)
+            # Return an explicit INFO finding rather than a silent skip so operators know
+            # this control was NOT assessed. A silent skip reads as "passed" in reports.
+            unassessed = self.finding(
+                title=f"{self.name} — not assessed (WinRM unavailable)",
+                description=(
+                    f"This check ({self.id}: {self.name}) requires authenticated WinRM access "
+                    "to a domain controller to collect registry values, service states, or "
+                    "other host-level data. WinRM was not available during this scan, so the "
+                    "security posture for this control is UNKNOWN. Re-run with WinRM credentials "
+                    "to obtain a definitive result."
+                ),
+                severity=Severity.INFO,
+                remediation_desc=(
+                    "Re-run ADSentinel with WinRM access: provide --winrm-user and ensure "
+                    "WinRM is enabled on the target DC (Enable-PSRemoting -Force)."
+                ),
+                source="WinRM",
+            )
             return CheckResult(
                 check_id=self.id,
                 check_name=self.name,
                 category=self.category,
+                findings=[unassessed],
                 skipped=True,
                 skip_reason="WinRM data not available",
             )

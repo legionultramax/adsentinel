@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Type
 from adsentinel.checks.base import BaseCheck
 from adsentinel.checks.registry import CheckRegistry
 from adsentinel.collectors.base import BaseCollector
+from adsentinel.collectors.acl_collector import ACLCollector
 from adsentinel.collectors.certificates import CertificateCollector
 from adsentinel.collectors.computers import ComputerCollector
 from adsentinel.collectors.dns import DNSCollector
@@ -21,6 +22,7 @@ from adsentinel.collectors.groups import GroupCollector
 from adsentinel.collectors.password_policies import PasswordPolicyCollector
 from adsentinel.collectors.trusts import TrustCollector
 from adsentinel.collectors.users import UserCollector
+from adsentinel.collectors.winrm_data import WinRMDataCollector
 from adsentinel.config import ScanConfig
 from adsentinel.datasources.ldap_source import LDAPSource
 from adsentinel.datasources.winrm_source import WinRMSource
@@ -32,7 +34,8 @@ from adsentinel.models.finding import CheckResult, Finding
 logger = get_logger(__name__)
 
 
-# Ordered list of collectors (order matters: domain_info first, then users, then groups)
+# Ordered list of collectors (order matters: domain_info first, then users, then groups,
+# then WinRMDataCollector last so GPO paths are already populated for the SYSVOL scan)
 DEFAULT_COLLECTORS: List[Type[BaseCollector]] = [
     DomainInfoCollector,
     PasswordPolicyCollector,
@@ -43,6 +46,8 @@ DEFAULT_COLLECTORS: List[Type[BaseCollector]] = [
     GPOCollector,
     DNSCollector,
     CertificateCollector,
+    ACLCollector,        # after DomainInfoCollector (needs base_dn + domain_sid)
+    WinRMDataCollector,  # must run after GPOCollector (needs gpo file_sys_path for SYSVOL scan)
 ]
 
 

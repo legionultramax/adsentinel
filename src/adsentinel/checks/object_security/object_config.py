@@ -114,19 +114,37 @@ class OBJ004_UsersWithoutExpiry(BaseCheck):
             if u.enabled and u.account_expires is None
             and u.sam_account_name not in ("krbtgt", "Guest", "Administrator")
         ]
-        # Only flag if a significant percentage
+        if not no_expiry:
+            return []
+
         total_enabled = len([u for u in self.context.users if u.enabled])
-        if no_expiry and total_enabled > 50 and len(no_expiry) > total_enabled * 0.9:
-            return [self.finding(
-                title=f"{len(no_expiry)} of {total_enabled} accounts have no expiration date",
-                description="Accounts without expiration dates remain active indefinitely. Contractor and temporary accounts should have defined expiration.",
-                severity=Severity.INFO,
-                affected_count=len(no_expiry),
-                remediation_desc="Set account expiration dates for contractor and temporary accounts.",
-                powershell="Search-ADAccount -AccountExpiring -TimeSpan 0 -UsersOnly | Where-Object Enabled",
-                nist_800_53=["AC-2"],
-            )]
-        return []
+        pct = round(len(no_expiry) / total_enabled * 100) if total_enabled else 0
+        severity = Severity.MEDIUM if pct > 50 else Severity.LOW
+
+        return [self.finding(
+            title=f"{len(no_expiry)} enabled account{'s have' if len(no_expiry) != 1 else ' has'} no expiration date",
+            description=(
+                f"{len(no_expiry)} of {total_enabled} enabled accounts ({pct}%) have no account expiration set. "
+                "Contractor, temporary, and vendor accounts should have a defined expiry — accounts that "
+                "outlive their purpose become orphaned credentials attackers can abuse long after the "
+                "employee or project is gone."
+            ),
+            severity=severity,
+            affected_count=len(no_expiry),
+            remediation_desc=(
+                "Review all accounts without expiration. Set account expiry on contractor, "
+                "temporary, and vendor accounts. Permanent employee accounts may be exempt, "
+                "but review any enabled account with no logon in 90+ days."
+            ),
+            powershell=(
+                "# Find enabled accounts with no expiry (excluding built-ins):\n"
+                "Get-ADUser -Filter {Enabled -eq $true -and AccountExpirationDate -notlike '*'} "
+                "-Properties AccountExpirationDate,LastLogonDate | "
+                "Where-Object {$_.SamAccountName -notin @('Administrator','Guest','krbtgt')} | "
+                "Select-Object Name,SamAccountName,LastLogonDate"
+            ),
+            nist_800_53=["AC-2"],
+        )]
 
 
 @check
@@ -169,17 +187,35 @@ class OBJ006_StaleDisabledAccounts(BaseCheck):
             if not u.enabled and days_since(u.last_logon) > 365
             and u.sam_account_name not in ("krbtgt", "Guest")
         ]
-        if long_disabled and len(long_disabled) > 50:
-            return [self.finding(
-                title=f"{len(long_disabled)} accounts have been disabled for over a year",
-                description="Long-disabled accounts should be deleted to reduce directory bloat and eliminate re-enablement risk.",
-                severity=Severity.LOW,
-                affected_count=len(long_disabled),
-                remediation_desc="Delete accounts that have been disabled for more than 1 year.",
-                powershell="Search-ADAccount -AccountDisabled -UsersOnly | Where-Object {$_.LastLogonDate -lt (Get-Date).AddDays(-365)} | Remove-ADUser",
-                nist_800_53=["AC-2"],
-            )]
-        return []
+        if not long_disabled:
+            return []
+
+        severity = Severity.MEDIUM if len(long_disabled) > 20 else Severity.LOW
+
+        return [self.finding(
+            title=f"{len(long_disabled)} account{'s have' if len(long_disabled) != 1 else ' has'} been disabled for over a year",
+            description=(
+                f"{len(long_disabled)} disabled account{'s' if len(long_disabled) != 1 else ''} "
+                "have not logged on in over 365 days. Disabled accounts are a re-enablement risk: "
+                "if an attacker gains write access to any of them, they have a ready-made credential "
+                "with an established identity. Large counts of stale disabled accounts also suggest "
+                "the offboarding process does not include object deletion."
+            ),
+            severity=severity,
+            affected_count=len(long_disabled),
+            remediation_desc=(
+                "Delete or archive accounts disabled for more than 1 year. "
+                "Establish an offboarding process that deletes AD objects within 90 days of disabling."
+            ),
+            powershell=(
+                "# Find disabled accounts inactive > 1 year:\n"
+                "Search-ADAccount -AccountDisabled -UsersOnly | "
+                "Where-Object {$_.LastLogonDate -lt (Get-Date).AddDays(-365) -and "
+                "$_.SamAccountName -notin @('Guest','krbtgt')} | "
+                "Select-Object Name,SamAccountName,LastLogonDate,DistinguishedName"
+            ),
+            nist_800_53=["AC-2"],
+        )]
 
 
 @check
@@ -226,10 +262,15 @@ class OBJ008_ComputersInDefaultOU(BaseCheck):
             c for c in self.context.computers
             if c.dn.upper().endswith(default_cn.upper())
         ]
-        if in_default and len(in_default) > 10:
+        if in_default:
             return [self.finding(
-                title=f"{len(in_default)} computers are in the default Computers container",
-                description="Computers in the default container don't receive OU-linked GPOs. They should be moved to appropriate OUs for policy enforcement.",
+                title=f"{len(in_default)} computer{'s' if len(in_default) != 1 else ''} in the default Computers container",
+                description=(
+                    f"{len(in_default)} computer account{'s are' if len(in_default) != 1 else ' is'} "
+                    "in CN=Computers — the default drop zone for machines joined without a prestage OU. "
+                    "Objects here receive no OU-linked GPOs, so security baselines, LAPS policy, "
+                    "BitLocker, and endpoint hardening GPOs are never applied."
+                ),
                 severity=Severity.MEDIUM,
                 affected_objects=[self.affected_computer(c) for c in in_default[:50]],
                 affected_count=len(in_default),
@@ -256,10 +297,15 @@ class OBJ009_UsersInDefaultOU(BaseCheck):
             and u.dn.upper().endswith(default_cn.upper())
             and u.sam_account_name.lower() not in builtin_names
         ]
-        if in_default and len(in_default) > 5:
+        if in_default:
             return [self.finding(
-                title=f"{len(in_default)} user accounts are in the default Users container",
-                description="User accounts in the default container may not receive OU-specific GPOs for security hardening.",
+                title=f"{len(in_default)} enabled user{'s' if len(in_default) != 1 else ''} in the default Users container",
+                description=(
+                    f"{len(in_default)} enabled user account{'s are' if len(in_default) != 1 else ' is'} "
+                    "in CN=Users — the default container for manually created accounts. "
+                    "Objects here receive no OU-linked GPOs: password complexity, logon restrictions, "
+                    "and endpoint hardening settings from OU GPOs are not applied."
+                ),
                 severity=Severity.LOW,
                 affected_objects=[self.affected_user(u) for u in in_default[:50]],
                 affected_count=len(in_default),

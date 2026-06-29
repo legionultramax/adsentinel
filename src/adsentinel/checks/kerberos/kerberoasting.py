@@ -1,4 +1,4 @@
-"""Kerberos Security checks (KRB-001 to KRB-015)."""
+"""Kerberos Security checks (KRB-001 to KRB-016)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,16 @@ from typing import List
 from adsentinel.checks.base import BaseCheck, check
 from adsentinel.constants import (
     MITRE_ASREP_ROASTING,
+    MITRE_DCSYNC,
     MITRE_GOLDEN_TICKET,
     MITRE_KERBEROASTING,
     MITRE_UNCONSTRAINED_DELEGATION,
+    RID_KRBTGT,
 )
 from adsentinel.models.compliance import MitreAttack
 from adsentinel.models.finding import AffectedObject, Finding
 from adsentinel.models.severity import Severity
+from adsentinel.utils.sid import get_rid
 
 
 @check
@@ -113,11 +116,11 @@ class KRB003_UnconstrainedDelegation(BaseCheck):
                 nist_800_53=["AC-6"],
             ))
 
-        # Check computer accounts (exclude DCs)
+        # Check computer accounts (exclude DCs — members of the Domain Controllers group)
         unconstrained_computers = [
             c for c in self.context.computers
             if c.enabled and c.trusted_for_delegation
-            and "Domain Controllers" not in str(c.member_of)
+            and not any("CN=Domain Controllers" in dn for dn in (c.member_of or []))
         ]
         if unconstrained_computers:
             findings.append(self.finding(
@@ -374,32 +377,6 @@ class KRB011_ComputerShadowCredentials(BaseCheck):
 
 
 @check
-class KRB012_ComputerUnconstrained(BaseCheck):
-    id = "KRB-012"
-    name = "Computers with Unconstrained Delegation"
-    description = "Check for non-DC computers with unconstrained delegation"
-    category = "Kerberos Security"
-
-    def run(self) -> List[Finding]:
-        unconstrained = [
-            c for c in self.context.computers
-            if c.enabled and c.trusted_for_delegation
-        ]
-        # This is covered by KRB-003, so only report if there are a lot
-        if len(unconstrained) > 5:
-            return [self.finding(
-                title=f"High number of computers with unconstrained delegation ({len(unconstrained)})",
-                description="A large number of computers have unconstrained delegation, significantly increasing the attack surface.",
-                severity=Severity.HIGH,
-                affected_objects=[self.affected_computer(c) for c in unconstrained[:50]],
-                affected_count=len(unconstrained),
-                remediation_desc="Review and convert to constrained delegation or RBCD.",
-                nist_800_53=["AC-6"],
-            )]
-        return []
-
-
-@check
 class KRB013_DelegationToSensitive(BaseCheck):
     id = "KRB-013"
     name = "Delegation to Domain Controllers"
@@ -464,6 +441,276 @@ class KRB014_StaleKerberoastable(BaseCheck):
                 nist_800_53=["IA-5"],
             )]
         return []
+
+
+@check
+class KRB016_KRBTGTAccountSecurity(BaseCheck):
+    """Dedicated security audit of the krbtgt account.
+
+    The krbtgt account is the KDC service account whose NT hash is the domain's
+    master Kerberos secret — compromising it yields a Golden Ticket, granting
+    unlimited, persistent, domain-wide access.  Any misconfiguration that
+    exposes that hash (kerberoastable SPN, AS-REP roastable, delegation) is
+    immediately catastrophic.  This check audits four independent attack surfaces
+    on the account and fires a separate, targeted finding for each one found.
+    """
+
+    id = "KRB-016"
+    name = "KRBTGT Account Security Audit"
+    description = (
+        "Audit the krbtgt account for SPNs (kerberoastable), disabled pre-auth "
+        "(AS-REP roastable), and delegation flags — each independently enables "
+        "offline recovery of the domain's Kerberos master secret"
+    )
+    category = "Kerberos Security"
+
+    # kadmin/changepw is the only SPN that can appear by design in mixed
+    # Unix environments; it still makes krbtgt roastable, so we flag it
+    # but at slightly lower severity and with an extra context note.
+    _UNIX_COMPAT_SPN = "kadmin/changepw"
+
+    def run(self) -> List[Finding]:
+        # Locate krbtgt by RID 502 — name-rename-proof
+        krbtgt = next(
+            (u for u in self.context.users if get_rid(u.sid) == RID_KRBTGT),
+            None,
+        )
+        if krbtgt is None:
+            return []
+
+        findings: List[Finding] = []
+
+        # ── 1. SPNs present — krbtgt is Kerberoastable ───────────────────────
+        if krbtgt.spn_list:
+            unix_only = (
+                len(krbtgt.spn_list) == 1
+                and krbtgt.spn_list[0].lower() == self._UNIX_COMPAT_SPN
+            )
+            spn_list_str = "\n".join(f"  • {s}" for s in krbtgt.spn_list)
+            if unix_only:
+                description = (
+                    "The krbtgt account has one SPN: kadmin/changepw. "
+                    "This SPN exists for MIT Kerberos password-change protocol "
+                    "compatibility (RFC 3244) and is sometimes added during "
+                    "Unix/Linux realm integration. "
+                    "Even so, it makes krbtgt Kerberoastable: any authenticated "
+                    "domain user can request a TGS for this SPN and receive a "
+                    "ticket encrypted with the krbtgt NT hash. "
+                    "Cracking the ticket offline is equivalent to a Golden Ticket "
+                    "attack — the recovered hash can forge Kerberos tickets for "
+                    "any account in the domain, indefinitely.\n\n"
+                    f"SPN present:\n{spn_list_str}"
+                )
+            else:
+                description = (
+                    "The krbtgt account has one or more ServicePrincipalNames set. "
+                    "No SPN should ever exist on krbtgt in a Windows-only environment. "
+                    "Any authenticated domain user can request a TGS ticket for each "
+                    "of these SPNs. Each ticket is encrypted with the krbtgt NT hash "
+                    "(the domain's Kerberos master key). Cracking any one ticket gives "
+                    "an attacker full Golden Ticket capability: they can forge tickets "
+                    "for any user — including domain admins — with any group membership, "
+                    "with no expiry, without touching a DC again.\n\n"
+                    f"SPNs present:\n{spn_list_str}"
+                )
+
+            findings.append(self.finding(
+                title=(
+                    "krbtgt is Kerberoastable — SPN(s) expose the domain Kerberos master secret"
+                    if not unix_only else
+                    "krbtgt has kadmin/changepw SPN — Kerberoastable (Unix compatibility remnant)"
+                ),
+                description=description,
+                severity=Severity.CRITICAL,
+                affected_objects=[self.affected_user(krbtgt)],
+                remediation_desc=(
+                    "Remove all SPNs from the krbtgt account immediately:\n"
+                    "1. Run: Set-ADUser krbtgt -ServicePrincipalNames @{}\n"
+                    "2. Verify: Get-ADUser krbtgt -Properties ServicePrincipalName\n"
+                    "3. Rotate the krbtgt password twice (12+ hour gap) to invalidate "
+                    "any TGS tickets already issued against the old hash."
+                ),
+                powershell=(
+                    "# Remove all SPNs from krbtgt:\n"
+                    "$krbtgt = Get-ADUser krbtgt -Properties ServicePrincipalName\n"
+                    "foreach ($spn in $krbtgt.ServicePrincipalName) {\n"
+                    "    Set-ADUser krbtgt -ServicePrincipalNames @{Remove = $spn}\n"
+                    "}\n\n"
+                    "# Verify clean:\n"
+                    "Get-ADUser krbtgt -Properties ServicePrincipalName | "
+                    "Select-Object -ExpandProperty ServicePrincipalName\n\n"
+                    "# Then rotate password twice (wait 10+ hours between runs):\n"
+                    "# Use Microsoft's KRBTGT key rotation script (KrbtgtKeys.ps1)"
+                ),
+                manual_steps=[
+                    "Open ADUC, locate the krbtgt account in Users container.",
+                    "Open Properties → Attribute Editor → servicePrincipalName.",
+                    "Remove all values. Click OK.",
+                    "Rotate the krbtgt password twice (≥10 hours between rotations) "
+                    "to ensure no previously-issued TGS tickets remain valid.",
+                    "If SPN was added for Unix integration, configure the Kerberos "
+                    "realm to use a dedicated service account instead of krbtgt.",
+                ],
+                mitre=[
+                    MitreAttack(
+                        technique_id=MITRE_KERBEROASTING,
+                        technique_name="Kerberoasting",
+                        tactic="Credential Access",
+                    ),
+                    MitreAttack(
+                        technique_id=MITRE_GOLDEN_TICKET,
+                        technique_name="Golden Ticket",
+                        tactic="Credential Access",
+                    ),
+                ],
+                cis_controls=["5.4", "5.5"],
+                nist_800_53=["IA-5", "AC-6", "SC-13"],
+                details={
+                    "spns": krbtgt.spn_list,
+                    "unix_compat_only": unix_only,
+                },
+            ))
+
+        # ── 2. Pre-authentication disabled — krbtgt is AS-REP Roastable ──────
+        if krbtgt.dont_require_preauth:
+            findings.append(self.finding(
+                title="krbtgt has pre-authentication disabled — AS-REP Roastable",
+                description=(
+                    "The DONT_REQ_PREAUTH flag is set on the krbtgt account. "
+                    "This means any unauthenticated network client can send an AS-REQ "
+                    "without supplying encrypted pre-auth data and will receive an AS-REP "
+                    "whose enc-part is encrypted with the krbtgt NT hash. "
+                    "The AS-REP can be captured and cracked offline with no domain credentials "
+                    "whatsoever. Successful cracking yields the krbtgt hash — "
+                    "equivalent to compromising the entire domain's Kerberos infrastructure.\n\n"
+                    "This is an extremely rare configuration and should be treated as evidence "
+                    "of either a critical misconfiguration or active adversary tampering."
+                ),
+                severity=Severity.CRITICAL,
+                affected_objects=[self.affected_user(krbtgt)],
+                remediation_desc=(
+                    "1. Re-enable Kerberos pre-authentication on krbtgt immediately.\n"
+                    "2. Investigate HOW this flag was set — check AD audit logs for "
+                    "   who modified the krbtgt UAC attribute and when.\n"
+                    "3. Rotate the krbtgt password twice (10+ hour gap between rotations).\n"
+                    "4. Consider a full domain compromise assessment."
+                ),
+                powershell=(
+                    "# Re-enable pre-authentication on krbtgt:\n"
+                    "Set-ADAccountControl krbtgt -DoesNotRequirePreAuth $false\n\n"
+                    "# Verify:\n"
+                    "Get-ADUser krbtgt -Properties DoesNotRequirePreAuth | "
+                    "Select-Object DoesNotRequirePreAuth\n\n"
+                    "# Audit: who changed krbtgt UAC attribute?\n"
+                    "Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4738} | "
+                    "Where-Object {$_.Message -like '*krbtgt*'} | "
+                    "Select-Object TimeCreated, Message | Format-List"
+                ),
+                mitre=[
+                    MitreAttack(
+                        technique_id=MITRE_ASREP_ROASTING,
+                        technique_name="AS-REP Roasting",
+                        tactic="Credential Access",
+                    ),
+                    MitreAttack(
+                        technique_id=MITRE_GOLDEN_TICKET,
+                        technique_name="Golden Ticket",
+                        tactic="Credential Access",
+                    ),
+                ],
+                cis_controls=["5.4"],
+                nist_800_53=["IA-5", "AC-6"],
+            ))
+
+        # ── 3. Unconstrained delegation on krbtgt ────────────────────────────
+        if krbtgt.trusted_for_delegation:
+            findings.append(self.finding(
+                title="krbtgt has unconstrained delegation enabled — highly anomalous",
+                description=(
+                    "TrustedForDelegation is set on the krbtgt account. "
+                    "There is no legitimate operational reason for krbtgt to have "
+                    "unconstrained Kerberos delegation. When an account with unconstrained "
+                    "delegation receives a Kerberos authentication, the KDC embeds a copy "
+                    "of the authenticating user's TGT into the service ticket. "
+                    "Any service or process running as krbtgt could therefore collect TGTs "
+                    "for all authenticating users and use them to impersonate those users "
+                    "against any service in the domain.\n\n"
+                    "Combined with krbtgt's role as the KDC service account, this flag "
+                    "represents a multi-layered privilege escalation path. "
+                    "Its presence on krbtgt is a strong indicator of adversary tampering."
+                ),
+                severity=Severity.CRITICAL,
+                affected_objects=[self.affected_user(krbtgt)],
+                remediation_desc=(
+                    "1. Remove the TrustedForDelegation flag from krbtgt.\n"
+                    "2. Investigate who set this flag and when (Security event 4738).\n"
+                    "3. Rotate krbtgt password twice. Consider a full compromise assessment."
+                ),
+                powershell=(
+                    "# Remove unconstrained delegation from krbtgt:\n"
+                    "Set-ADAccountControl krbtgt -TrustedForDelegation $false\n\n"
+                    "# Verify:\n"
+                    "Get-ADUser krbtgt -Properties TrustedForDelegation | "
+                    "Select-Object TrustedForDelegation\n\n"
+                    "# Audit: who set delegation on krbtgt?\n"
+                    "Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4738} | "
+                    "Where-Object {$_.Message -like '*krbtgt*'} | Format-List"
+                ),
+                mitre=[
+                    MitreAttack(
+                        technique_id=MITRE_UNCONSTRAINED_DELEGATION,
+                        technique_name="Steal or Forge Kerberos Tickets",
+                        tactic="Credential Access",
+                    ),
+                ],
+                cis_controls=["5.4", "6.8"],
+                nist_800_53=["AC-6", "IA-5"],
+            ))
+
+        # ── 4. Protocol transition (S4U2Self) on krbtgt ──────────────────────
+        if krbtgt.trusted_to_auth_for_delegation:
+            findings.append(self.finding(
+                title="krbtgt has protocol transition (S4U2Self) enabled — highly anomalous",
+                description=(
+                    "TrustedToAuthForDelegation is set on the krbtgt account. "
+                    "Protocol transition (S4U2Self) allows an account to obtain a service "
+                    "ticket for itself on behalf of any user, regardless of whether the "
+                    "user authenticated with Kerberos. Combined with S4U2Proxy, it enables "
+                    "full impersonation of any domain account to any service. "
+                    "There is no legitimate operational scenario requiring protocol "
+                    "transition on krbtgt. This is a strong indicator of deliberate "
+                    "backdoor installation by an attacker who already had Domain Admin access."
+                ),
+                severity=Severity.CRITICAL,
+                affected_objects=[self.affected_user(krbtgt)],
+                remediation_desc=(
+                    "1. Remove the TrustedToAuthForDelegation flag from krbtgt.\n"
+                    "2. Audit Security event 4738 to determine when and by whom this was set.\n"
+                    "3. Perform a full domain compromise assessment — this misconfiguration "
+                    "   does not appear accidentally."
+                ),
+                powershell=(
+                    "# Remove S4U2Self from krbtgt:\n"
+                    "Set-ADAccountControl krbtgt -TrustedToAuthForDelegation $false\n\n"
+                    "# Verify:\n"
+                    "Get-ADUser krbtgt -Properties TrustedToAuthForDelegation | "
+                    "Select-Object TrustedToAuthForDelegation\n\n"
+                    "# Audit log:\n"
+                    "Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4738} | "
+                    "Where-Object {$_.Message -like '*krbtgt*'} | Format-List"
+                ),
+                mitre=[
+                    MitreAttack(
+                        technique_id=MITRE_UNCONSTRAINED_DELEGATION,
+                        technique_name="Steal or Forge Kerberos Tickets",
+                        tactic="Credential Access",
+                    ),
+                ],
+                cis_controls=["5.4"],
+                nist_800_53=["AC-6"],
+            ))
+
+        return findings
 
 
 @check

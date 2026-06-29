@@ -148,15 +148,24 @@ class TestAUTH005LDAPSigning:
 
 
 class TestAUTH009AnonymousBind:
-    def test_low_functional_level(self, context):
-        context.domain_info.domain_functional_level = 2
+    def test_key_absent_returns_info(self, context):
+        # dsHeuristics not in raw_entries = collector couldn't read CN=Directory Service
         check = AUTH009_AnonymousBind(context)
         findings = check.run()
         assert len(findings) == 1
-        assert findings[0].severity.value == "MEDIUM"
+        assert findings[0].severity.value == "INFO"
 
-    def test_high_functional_level(self, context):
-        context.domain_info.domain_functional_level = 7
+    def test_anon_bind_enabled_returns_high(self, context):
+        # Position 7 (index 6) set to '2' = anonymous bind explicitly enabled
+        context.raw_entries["dsHeuristics"] = "0000002"
+        check = AUTH009_AnonymousBind(context)
+        findings = check.run()
+        assert len(findings) == 1
+        assert findings[0].severity.value == "HIGH"
+
+    def test_anon_bind_disabled_clean(self, context):
+        # Key present but position 7 is not '2' = blocked (secure default)
+        context.raw_entries["dsHeuristics"] = ""
         check = AUTH009_AnonymousBind(context)
         assert len(check.run()) == 0
 

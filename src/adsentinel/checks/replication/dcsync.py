@@ -73,18 +73,28 @@ class REP003_StaleDCPasswords(BaseCheck):
         for comp in self.context.computers:
             if comp.dns_hostname and comp.dns_hostname.lower() in dc_hostnames:
                 age = days_since(comp.password_last_set)
-                if age > 60:
+                if age > 30:
                     stale_dcs.append(comp)
 
         if stale_dcs:
             return [self.finding(
-                title=f"{len(stale_dcs)} DC computer accounts have passwords older than 60 days",
-                description="Domain controller machine passwords should rotate automatically every 30 days. Old passwords may indicate replication or service issues.",
+                title=f"{len(stale_dcs)} DC computer account{'s have' if len(stale_dcs) != 1 else ' has'} passwords older than 30 days",
+                description=(
+                    "Domain controller machine passwords rotate automatically every 30 days by default "
+                    "(MaximumPasswordAge). A password older than 30 days means the DC has missed at least "
+                    "one automatic rotation cycle — indicating replication failure, a DC taken offline, "
+                    "or deliberate prevention. Stale DC machine passwords are a DCSync detection signal "
+                    "and can indicate a rogue or compromised DC."
+                ),
                 severity=Severity.MEDIUM,
                 affected_objects=[self.affected_computer(c) for c in stale_dcs],
                 affected_count=len(stale_dcs),
-                remediation_desc="Investigate DC replication health and machine password rotation.",
-                powershell="Get-ADDomainController -Filter * | Select-Object Name, @{N='PwdAge';E={(New-TimeSpan $_.PasswordLastSet (Get-Date)).Days}}",
+                remediation_desc=(
+                    "Investigate DC replication health (repadmin /showrepl). "
+                    "Ensure MaximumPasswordAge is not disabled. "
+                    "For each stale DC, verify it is replicating and force a password reset if needed."
+                ),
+                powershell="Get-ADDomainController -Filter * | Select-Object Name, @{N='PwdAgeDays';E={(New-TimeSpan $_.PasswordLastSet (Get-Date)).Days}} | Sort-Object PwdAgeDays -Descending",
                 nist_800_53=["IA-5"],
             )]
         return []

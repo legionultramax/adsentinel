@@ -10,6 +10,7 @@ from adsentinel.constants import (
     CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME,
     CT_FLAG_NO_SECURITY_EXTENSION,
     CT_FLAG_PEND_ALL_REQUESTS,
+    CT_FLAG_REQUIRE_PRIVATE_KEY_ARCHIVAL,
     EDITF_ATTRIBUTESUBJECTALTNAME2,
     EKU_ANY_PURPOSE,
     EKU_CERTIFICATE_REQUEST_AGENT,
@@ -71,6 +72,7 @@ class CertificateCollector(BaseCollector):
             ekus = self._get_list(attrs, "pKIExtendedKeyUsage")
             app_policies = self._get_list(attrs, "msPKI-Certificate-Application-Policy")
             schema_version = self._get_int(attrs, "msPKI-Template-Schema-Version")
+            private_key_flag = self._get_int(attrs, "msPKI-Private-Key-Flag")
 
             # Combine EKUs from both attributes
             all_ekus = list(set(ekus + app_policies))
@@ -98,6 +100,8 @@ class CertificateCollector(BaseCollector):
                 ),
                 "allows_any_purpose": EKU_ANY_PURPOSE in all_ekus or not all_ekus,
                 "is_request_agent": EKU_CERTIFICATE_REQUEST_AGENT in all_ekus,
+                "private_key_flag": private_key_flag,
+                "requires_key_archival": bool(private_key_flag & CT_FLAG_REQUIRE_PRIVATE_KEY_ARCHIVAL),
             }
             templates.append(template)
 
@@ -143,6 +147,7 @@ class CertificateCollector(BaseCollector):
                     "distinguishedName", "cn", "dNSHostName",
                     "certificateTemplates", "flags",
                     "msPKI-Enrollment-Servers",
+                    "msPKI-RA-Certificate",
                 ],
             )
         except Exception as e:
@@ -155,6 +160,12 @@ class CertificateCollector(BaseCollector):
             flags = self._get_int(attrs, "flags")
             templates = self._get_list(attrs, "certificateTemplates")
             enrollment_servers = self._get_list(attrs, "msPKI-Enrollment-Servers")
+            # msPKI-RA-Certificate: list of DER-encoded KRA (Key Recovery Agent) certificates.
+            # Non-empty means the CA is configured to archive private keys (ESC12).
+            kra_certs_raw = attrs.get("msPKI-RA-Certificate", [])
+            if not isinstance(kra_certs_raw, list):
+                kra_certs_raw = [kra_certs_raw] if kra_certs_raw else []
+            kra_cert_count = len([c for c in kra_certs_raw if c])
 
             services.append({
                 "dn": entry.get("dn", ""),
@@ -165,6 +176,8 @@ class CertificateCollector(BaseCollector):
                 "san_flag_enabled": bool(flags & EDITF_ATTRIBUTESUBJECTALTNAME2),
                 "enrollment_servers": enrollment_servers,
                 "has_http_enrollment": any("http" in s.lower() for s in enrollment_servers),
+                "kra_cert_count": kra_cert_count,
+                "has_kra_certificates": kra_cert_count > 0,
             })
 
         context.enrollment_services = services

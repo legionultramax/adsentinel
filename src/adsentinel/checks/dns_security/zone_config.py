@@ -1,4 +1,7 @@
-"""DNS Security checks (DNS-001 to DNS-006)."""
+"""DNS Security checks (DNS-001 to DNS-006).
+
+DNS-006: IPv6 enabled on Domain Controllers (mitm6 attack vector).
+"""
 
 from __future__ import annotations
 
@@ -130,3 +133,96 @@ class DNS005_DangerousRecords(BaseCheck):
                     nist_800_53=["SC-20"],
                 )]
         return []
+
+
+@check
+class DNS006_IPv6EnabledOnDCs(BaseCheck):
+    id = "DNS-006"
+    name = "IPv6 Enabled on Domain Controllers (mitm6 Vector)"
+    description = (
+        "IPv6 is enabled by default on all modern Windows servers. When DHCPv6 is not "
+        "actively used, attackers can run mitm6 to win DHCPv6 negotiations, redirect DNS "
+        "queries, and relay authentication (NTLM/Kerberos) to seize domain resources. "
+        "If IPv6 is not needed, disabling it removes this entire attack surface."
+    )
+    category = "DNS Security"
+    requires_winrm = True
+
+    # DisabledComponents bitmask (HKLM\...\Tcpip6\Parameters):
+    #   bit 0 (0x01) — disable IPv6 on all non-tunnel interfaces
+    #   bit 1 (0x02) — disable IPv6 on all tunnel interfaces
+    #   0xFF (255)   — fully disable IPv6 (recommended hardening value)
+    # If bit 0 is NOT set, at least one network interface accepts IPv6 traffic.
+    _SAFE_MASK = 0x01
+
+    def run(self) -> List[Finding]:
+        raw = self.context.registry_values.get("IPv6DisabledComponents")
+
+        if raw is not None:
+            val = safe_int(raw)
+            if val is not None and (val & self._SAFE_MASK):
+                return []  # IPv6 disabled on all non-tunnel interfaces — clean
+
+        val_int = safe_int(raw) if raw is not None else None
+        if raw is None:
+            state = "IPv6 is enabled by default (DisabledComponents registry key is absent)"
+            severity = Severity.HIGH
+        elif val_int == 0:
+            state = f"IPv6 is fully enabled (DisabledComponents=0, all bits clear)"
+            severity = Severity.HIGH
+        else:
+            state = f"IPv6 is partially enabled (DisabledComponents={raw.strip()}, bit 0 not set)"
+            severity = Severity.MEDIUM
+
+        dc_count = len(self.context.domain_info.domain_controllers)
+        dc_label = f"{dc_count} domain controller{'s' if dc_count != 1 else ''}"
+
+        return [self.finding(
+            title=f"IPv6 enabled on {dc_label} — mitm6 relay attack is possible",
+            description=(
+                f"{state}. All {dc_label} accept IPv6 traffic. "
+                "The mitm6 tool abuses DHCPv6 to become the preferred DNS server for "
+                "machines on the network, then relays their authentication to Active "
+                "Directory (typically via ntlmrelayx) to create computer accounts, "
+                "modify ACLs, or achieve full domain compromise. "
+                "CVE impact: no specific CVE — this exploits a Windows design default."
+            ),
+            severity=severity,
+            remediation_desc=(
+                "If IPv6 is not required, fully disable it on all DC interfaces by setting "
+                "DisabledComponents to 0xFF (255). Apply via GPO to all Domain Controllers OU. "
+                "Also add ISATAP and WPAD to the DNS Global Query Block List."
+            ),
+            powershell=(
+                "# Via GPO (preferred — targets all DCs):\n"
+                "# Computer Configuration → Policies → Windows Settings → Registry\n"
+                "# Key: HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\n"
+                "# Value: DisabledComponents  Type: REG_DWORD  Data: 0xFF\n\n"
+                "# Or directly on each DC (requires reboot):\n"
+                "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters' "
+                "-Name DisabledComponents -Value 0xFF -Type DWord\n\n"
+                "# Block ISATAP and WPAD in DNS Global Query Block List:\n"
+                "Set-DnsServerGlobalQueryBlockList -List 'wpad','isatap' -Enable $true"
+            ),
+            mitre=[
+                MitreAttack(
+                    technique_id="T1557.001",
+                    technique_name="LLMNR/NBT-NS Poisoning and SMB Relay",
+                    tactic="Credential Access",
+                ),
+                MitreAttack(
+                    technique_id="T1021.002",
+                    technique_name="SMB/Windows Admin Shares",
+                    tactic="Lateral Movement",
+                ),
+            ],
+            cis_controls=["4.8", "12.2"],
+            nist_800_53=["CM-6", "CM-7", "SC-5"],
+            details={
+                "disabled_components_raw": raw,
+                "dc_count": dc_count,
+                "attack_tool": "mitm6 (https://github.com/dirkjanm/mitm6)",
+                "combined_attack": "mitm6 + ntlmrelayx → LDAP relay → domain compromise",
+            },
+            source="WinRM",
+        )]

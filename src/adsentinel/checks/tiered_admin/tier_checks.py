@@ -1,4 +1,4 @@
-"""Tiered Administration checks (TIER-001 to TIER-008)."""
+"""Tiered Administration checks (TIER-001 to TIER-009, excluding TIER-003)."""
 
 from __future__ import annotations
 
@@ -73,64 +73,76 @@ class TIER002_ServiceAccountTiering(BaseCheck):
 
 
 @check
-class TIER003_AdminCountHygiene(BaseCheck):
-    id = "TIER-003"
-    name = "AdminCount Cleanup"
-    description = "Check for orphaned adminCount=1 values"
-    category = "Tiered Administration"
-
-    def run(self) -> List[Finding]:
-        orphaned = [
-            u for u in self.context.users
-            if u.enabled and u.admin_count == 1
-            and not self.context.is_privileged_user(u)
-        ]
-        if orphaned:
-            return [self.finding(
-                title=f"{len(orphaned)} accounts have orphaned adminCount=1",
-                description=(
-                    "Accounts with adminCount=1 but not in privileged groups retain inherited "
-                    "AdminSDHolder ACLs. These accounts cannot have their permissions modified "
-                    "by normal delegation and may have stale, overly permissive ACLs."
-                ),
-                severity=Severity.LOW,
-                affected_objects=[self.affected_user(u) for u in orphaned[:50]],
-                affected_count=len(orphaned),
-                remediation_desc="Clear adminCount and reset ACL inheritance on orphaned accounts.",
-                powershell="Get-ADUser -Filter {adminCount -eq 1} | ForEach-Object { Set-ADUser $_ -Clear adminCount }",
-                nist_800_53=["AC-6"],
-            )]
-        return []
-
-
-@check
 class TIER004_DCSensitiveNotDelegated(BaseCheck):
     id = "TIER-004"
-    name = "Sensitive & Not Delegated on Tier 0"
-    description = "Check if Tier 0 accounts have 'Account is sensitive and cannot be delegated'"
+    name = "Privileged Accounts Not Marked Sensitive and Cannot Be Delegated"
+    description = (
+        "Flag privileged accounts that are not marked 'Account is sensitive and cannot be delegated'. "
+        "Without this flag an attacker who compromises a service running with unconstrained delegation "
+        "can forward the account's TGT to any backend service."
+    )
     category = "Tiered Administration"
 
     def run(self) -> List[Finding]:
-        priv_no_sensitive = [
+        not_sensitive = [
             u for u in self.context.users
-            if u.enabled and self.context.is_privileged_user(u)
+            if u.enabled
+            and self.context.is_privileged_user(u)
             and not u.sensitive_and_not_delegated
-            and not u.is_protected_user
+            and u.sam_account_name.lower() not in ("krbtgt",)
         ]
-        if priv_no_sensitive:
-            return [self.finding(
-                title=f"{len(priv_no_sensitive)} Tier 0 accounts without 'sensitive and cannot be delegated'",
-                description=(
-                    "Privileged accounts without this flag can have their credentials delegated "
-                    "through Kerberos delegation, enabling impersonation across services."
+        if not not_sensitive:
+            return []
+        return [self.finding(
+            title=(
+                f"{len(not_sensitive)} privileged account{'s' if len(not_sensitive) != 1 else ''} "
+                f"not marked 'sensitive and cannot be delegated'"
+            ),
+            description=(
+                "Tier 0 accounts (Domain Admins, Enterprise Admins, etc.) should have "
+                "'Account is sensitive and cannot be delegated' set. Without this flag, if "
+                "an account authenticates to a host running an unconstrained delegation service "
+                "(e.g., an IIS app pool or SQL Server), the receiving service can harvest and "
+                "reuse the account's TGT to authenticate anywhere in the domain — a direct Tier 0 "
+                "compromise path.\n\n"
+                "This flag also prevents S4U2Proxy abuse: a constrained-delegation service cannot "
+                "obtain a forwardable TGT on behalf of these accounts."
+            ),
+            severity=Severity.MEDIUM,
+            affected_objects=[self.affected_user(u) for u in not_sensitive[:50]],
+            affected_count=len(not_sensitive),
+            remediation_desc=(
+                "Enable 'Account is sensitive and cannot be delegated' on all Tier 0 accounts. "
+                "Verify no services legitimately require delegation on these accounts — if they do, "
+                "that is itself a tiering violation."
+            ),
+            powershell=(
+                "# Flag all Domain Admin accounts as sensitive\n"
+                "Get-ADGroupMember 'Domain Admins' | ForEach-Object {\n"
+                "    Set-ADAccountControl -Identity $_.DistinguishedName "
+                "-AccountNotDelegated $true\n"
+                "}\n\n"
+                "# Verify\n"
+                "Get-ADUser -Filter {adminCount -eq 1} "
+                "-Properties AccountNotDelegated | "
+                "Where-Object { -not $_.AccountNotDelegated } | "
+                "Select-Object SamAccountName"
+            ),
+            mitre=[
+                MitreAttack(
+                    technique_id="T1558.001",
+                    technique_name="Golden Ticket",
+                    tactic="Credential Access",
                 ),
-                severity=Severity.MEDIUM,
-                affected_objects=[self.affected_user(u) for u in priv_no_sensitive[:50]],
-                affected_count=len(priv_no_sensitive),
-                remediation_desc="Set 'Account is sensitive and cannot be delegated' on all Tier 0 accounts, or add them to Protected Users.",
-                nist_800_53=["AC-6"],
-            )]
-        return []
+                MitreAttack(
+                    technique_id="T1550.003",
+                    technique_name="Pass the Ticket",
+                    tactic="Lateral Movement",
+                ),
+            ],
+            cis_controls=["5.4", "6.3"],
+            nist_800_53=["AC-6", "IA-2", "CM-6"],
+        )]
 
 
 @check
@@ -262,3 +274,170 @@ class TIER008_GMSAAdoption(BaseCheck):
                 nist_800_53=["IA-5"],
             )]
         return []
+
+
+@check
+class TIER009_AuthNPolicyAbsence(BaseCheck):
+    id = "TIER-009"
+    name = "Authentication Policy / Silo Absence for Tier 0"
+    description = (
+        "Flag when no Authentication Policies or Silos are deployed and "
+        "privileged accounts are unprotected by Kerberos armoring controls."
+    )
+    category = "Tiered Administration"
+
+    # Domain functional level 6 = Windows Server 2012 R2 (feature introduction)
+    _MIN_FL_FOR_AUTHN_POLICY = 6
+
+    def run(self) -> List[Finding]:
+        fl = self.context.domain_info.domain_functional_level
+        if fl < self._MIN_FL_FOR_AUTHN_POLICY:
+            # Feature unavailable on this domain level — cannot flag absence
+            return []
+
+        policies: list = self.context.raw_entries.get("authn_policies", [])
+        silos: list = self.context.raw_entries.get("authn_silos", [])
+        assigned: list = self.context.raw_entries.get("authn_silo_members", [])
+
+        # Count enabled Tier 0 accounts (our proxy for "privileged account" population)
+        priv_users = [u for u in self.context.users if u.enabled and self.context.is_privileged_user(u)]
+        priv_count = len(priv_users)
+
+        if priv_count == 0:
+            return []
+
+        findings: List[Finding] = []
+
+        enabled_policies = [p for p in policies if p.get("enabled")]
+        enabled_silos = [s for s in silos if s.get("enabled")]
+
+        if not enabled_policies and not enabled_silos:
+            # Primary finding: feature not deployed at all
+            findings.append(self.finding(
+                title=(
+                    f"No Authentication Policies or Silos deployed — "
+                    f"{priv_count} Tier 0 account{'s' if priv_count != 1 else ''} unprotected"
+                ),
+                description=(
+                    "Authentication Policies (introduced in Windows Server 2012 R2) allow you to "
+                    "restrict which hosts a Kerberos TGT can be issued from and cap TGT lifetime for "
+                    "privileged accounts. Authentication Silos bind accounts to a policy and enforce "
+                    "Kerberos armoring (FAST), preventing credential theft techniques such as "
+                    "Pass-the-Ticket and Golden Ticket attacks from operating outside the approved "
+                    "access tier.\n\n"
+                    "Neither feature is deployed in this domain. All Tier 0 accounts (Domain Admins, "
+                    "Enterprise Admins, Schema Admins, etc.) can obtain TGTs from any device, including "
+                    "compromised workstations, with no host binding or lifetime restriction enforced "
+                    "by the KDC."
+                ),
+                severity=Severity.HIGH,
+                affected_count=priv_count,
+                affected_objects=[self.affected_user(u) for u in priv_users[:30]],
+                remediation_desc=(
+                    "1. Create an Authentication Policy for Tier 0 accounts with a short TGT lifetime "
+                    "(e.g., 60 minutes) and restrict allowed-to-authenticate-from hosts to PAWs and DCs.\n"
+                    "2. Create an Authentication Silo, assign the policy, and add all Tier 0 accounts "
+                    "and their authorised hosts as silo members.\n"
+                    "3. Enable Kerberos Armoring (FAST) via GPO: Computer Configuration → Administrative "
+                    "Templates → System → KDC → 'Support for Dynamic Access Control and Kerberos armoring' "
+                    "→ Enabled.\n"
+                    "4. Initially enforce in audit mode (Enforce: No) until logon compatibility is "
+                    "confirmed across all Tier 0 service dependencies."
+                ),
+                powershell=(
+                    "# 1. Create Authentication Policy with 60-min TGT for users\n"
+                    "New-ADAuthenticationPolicy -Name 'Tier0-AuthNPolicy' "
+                    "-UserTGTLifetimeMins 60 -Enforce\n\n"
+                    "# 2. Create Authentication Silo and assign the policy\n"
+                    "New-ADAuthenticationPolicySilo -Name 'Tier0-Silo' "
+                    "-UserAuthenticationPolicy 'Tier0-AuthNPolicy' -Enforce\n\n"
+                    "# 3. Grant Domain Admins access to the silo\n"
+                    "Grant-ADAuthenticationPolicySiloAccess -Identity 'Tier0-Silo' "
+                    "-Account (Get-ADGroupMember 'Domain Admins')\n\n"
+                    "# 4. Assign silo to each Tier 0 account\n"
+                    "Get-ADGroupMember 'Domain Admins' | ForEach-Object {\n"
+                    "    Set-ADAccountAuthenticationPolicySilo -Identity $_.DistinguishedName "
+                    "-AuthenticationPolicySilo 'Tier0-Silo'\n"
+                    "}\n\n"
+                    "# 5. Verify assignments\n"
+                    "Get-ADAuthenticationPolicySiloData -Identity 'Tier0-Silo'"
+                ),
+                mitre=[
+                    MitreAttack(
+                        technique_id="T1558.001",
+                        technique_name="Golden Ticket",
+                        tactic="Credential Access",
+                    ),
+                    MitreAttack(
+                        technique_id="T1550.003",
+                        technique_name="Pass the Ticket",
+                        tactic="Lateral Movement",
+                    ),
+                    MitreAttack(
+                        technique_id="T1078.002",
+                        technique_name="Domain Accounts",
+                        tactic="Defense Evasion",
+                    ),
+                ],
+                cis_controls=["5.4", "6.3", "6.8"],
+                nist_800_53=["AC-2", "AC-6", "IA-2", "SC-8", "CM-6"],
+            ))
+            return findings
+
+        # Silos/policies exist — check if any privileged accounts are not assigned
+        assigned_dns = {entry["dn"].lower() for entry in assigned if entry.get("dn")}
+        unassigned_priv = [
+            u for u in priv_users
+            if u.dn.lower() not in assigned_dns
+        ]
+
+        if unassigned_priv:
+            silo_names = [s["name"] for s in enabled_silos]
+            findings.append(self.finding(
+                title=(
+                    f"{len(unassigned_priv)} Tier 0 account{'s' if len(unassigned_priv) != 1 else ''} "
+                    f"not assigned to any Authentication Silo"
+                ),
+                description=(
+                    f"Authentication Silos are deployed in this domain "
+                    f"({', '.join(silo_names) if silo_names else 'unnamed'}), "
+                    f"but {len(unassigned_priv)} privileged account(s) have no silo assignment "
+                    f"(msDS-AssignedAuthNPolicySilo is not set). Accounts outside a silo receive no "
+                    "KDC-enforced host binding or TGT lifetime restriction, leaving them exposed to "
+                    "Pass-the-Ticket and Golden Ticket lateral movement from any compromised host."
+                ),
+                severity=Severity.MEDIUM,
+                affected_count=len(unassigned_priv),
+                affected_objects=[self.affected_user(u) for u in unassigned_priv[:30]],
+                remediation_desc=(
+                    "Grant each unassigned Tier 0 account access to the appropriate silo and set "
+                    "msDS-AssignedAuthNPolicySilo using Set-ADAccountAuthenticationPolicySilo."
+                ),
+                powershell=(
+                    "# Find Tier 0 accounts not assigned to a silo\n"
+                    "Get-ADUser -Filter {adminCount -eq 1} -Properties msDS-AssignedAuthNPolicySilo |\n"
+                    "    Where-Object { -not $_.'msDS-AssignedAuthNPolicySilo' } |\n"
+                    "    Select-Object SamAccountName, DistinguishedName\n\n"
+                    "# Assign to silo (repeat per account)\n"
+                    "Grant-ADAuthenticationPolicySiloAccess -Identity 'Tier0-Silo' "
+                    "-Account '<SamAccountName>'\n"
+                    "Set-ADAccountAuthenticationPolicySilo -Identity '<SamAccountName>' "
+                    "-AuthenticationPolicySilo 'Tier0-Silo'"
+                ),
+                mitre=[
+                    MitreAttack(
+                        technique_id="T1558.001",
+                        technique_name="Golden Ticket",
+                        tactic="Credential Access",
+                    ),
+                    MitreAttack(
+                        technique_id="T1550.003",
+                        technique_name="Pass the Ticket",
+                        tactic="Lateral Movement",
+                    ),
+                ],
+                cis_controls=["5.4", "6.3"],
+                nist_800_53=["AC-2", "AC-6", "IA-2"],
+            ))
+
+        return findings
