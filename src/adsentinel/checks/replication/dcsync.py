@@ -27,6 +27,7 @@ class REP001_DCCount(BaseCheck):
                 description="A single domain controller means no fault tolerance. If it fails, the entire domain is unavailable.",
                 severity=Severity.HIGH,
                 remediation_desc="Deploy at least 2 domain controllers for redundancy.",
+                mitre=[MitreAttack(technique_id="T1078.002", technique_name="Domain Accounts", tactic="Persistence")],
                 nist_800_53=["CP-6"],
             )]
         return []
@@ -95,6 +96,7 @@ class REP003_StaleDCPasswords(BaseCheck):
                     "For each stale DC, verify it is replicating and force a password reset if needed."
                 ),
                 powershell="Get-ADDomainController -Filter * | Select-Object Name, @{N='PwdAgeDays';E={(New-TimeSpan $_.PasswordLastSet (Get-Date)).Days}} | Sort-Object PwdAgeDays -Descending",
+                mitre=[MitreAttack(technique_id=MITRE_DCSYNC, technique_name="DCSync", tactic="Credential Access")],
                 nist_800_53=["IA-5"],
             )]
         return []
@@ -113,10 +115,11 @@ class REP004_DCOSVersions(BaseCheck):
         if len(os_versions) > 2:
             return [self.finding(
                 title=f"Domain controllers run {len(os_versions)} different OS versions",
-                description=f"OS versions: {', '.join(os_versions)}. Mixed DC OS versions can cause compatibility issues.",
+                description=f"OS versions: {', '.join(os_versions)}. Mixed DC OS versions can cause compatibility issues and may expose older DCs to known exploitation paths.",
                 severity=Severity.LOW,
                 remediation_desc="Standardize DC operating system versions.",
                 details={"os_versions": list(os_versions)},
+                mitre=[MitreAttack(technique_id="T1068", technique_name="Exploitation for Privilege Escalation", tactic="Privilege Escalation")],
                 nist_800_53=["CM-6"],
             )]
         return []

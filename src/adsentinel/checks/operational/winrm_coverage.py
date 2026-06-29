@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import List
 
 from adsentinel.checks.base import BaseCheck, check
+from adsentinel.constants import MITRE_WINRM_LATERAL_MOVEMENT
 from adsentinel.models.compliance import MitreAttack
 from adsentinel.models.finding import Finding
 from adsentinel.models.severity import Severity
@@ -91,11 +92,10 @@ class WINRM001_CoverageGap(BaseCheck):
                 "Re-run adsentinel with --winrm (or without --no-winrm) to complete the assessment.",
                 "Treat WinRM-gated findings as unverified — assume worst-case (vulnerable) for reporting.",
             ],
-            mitre=[MitreAttack(
-                technique_id="T1003.001",
-                technique_name="LSASS Memory",
-                tactic="Credential Access",
-            )],
+            mitre=[
+                MitreAttack(technique_id="T1003.001", technique_name="LSASS Memory", tactic="Credential Access"),
+                MitreAttack(technique_id=MITRE_WINRM_LATERAL_MOVEMENT, technique_name="Windows Remote Management", tactic="Lateral Movement"),
+            ],
             nist_800_53=["CA-7", "RA-5"],
             details={
                 "skipped_check_count": len(skipped),

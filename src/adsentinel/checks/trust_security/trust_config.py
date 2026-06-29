@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import List
 
 from adsentinel.checks.base import BaseCheck, check
+from adsentinel.constants import MITRE_DOMAIN_TRUST_DISCOVERY, MITRE_DOMAIN_TRUST_MODIFICATION
 from adsentinel.models.compliance import MitreAttack
 from adsentinel.models.finding import AffectedObject, Finding
 from adsentinel.models.severity import Severity
@@ -31,6 +32,7 @@ class TR001_BidirectionalTrusts(BaseCheck):
                 ],
                 affected_count=len(bidi),
                 remediation_desc="Review if bidirectional trust is required. Consider one-way trusts where possible.",
+                mitre=[MitreAttack(technique_id=MITRE_DOMAIN_TRUST_DISCOVERY, technique_name="Domain Trust Discovery", tactic="Discovery")],
                 nist_800_53=["AC-20"],
             )]
         return []
@@ -90,6 +92,7 @@ class TR003_NoSelectiveAuth(BaseCheck):
                 affected_count=len(no_selective),
                 remediation_desc="Enable selective authentication to restrict which users can authenticate across the trust.",
                 powershell="Set-ADTrust -Identity 'TRUSTEDDOMAIN' -SelectiveAuthentication $true",
+                mitre=[MitreAttack(technique_id=MITRE_DOMAIN_TRUST_DISCOVERY, technique_name="Domain Trust Discovery", tactic="Discovery")],
                 nist_800_53=["AC-20"],
             )]
         return []
@@ -115,6 +118,10 @@ class TR004_ForestTrustTransitive(BaseCheck):
                 ],
                 affected_count=len(forest_trusts),
                 remediation_desc="Review forest trust topology for unintended transitive paths.",
+                mitre=[
+                    MitreAttack(technique_id=MITRE_DOMAIN_TRUST_DISCOVERY, technique_name="Domain Trust Discovery", tactic="Discovery"),
+                    MitreAttack(technique_id=MITRE_DOMAIN_TRUST_MODIFICATION, technique_name="Domain Trust Modification", tactic="Defense Evasion"),
+                ],
                 nist_800_53=["AC-20"],
             )]
         return []
@@ -140,6 +147,7 @@ class TR005_TrustToOldDomain(BaseCheck):
                 ],
                 affected_count=len(external),
                 remediation_desc="Review and remove unnecessary external trusts.",
+                mitre=[MitreAttack(technique_id=MITRE_DOMAIN_TRUST_DISCOVERY, technique_name="Domain Trust Discovery", tactic="Discovery")],
                 nist_800_53=["AC-20"],
             )]
         return []

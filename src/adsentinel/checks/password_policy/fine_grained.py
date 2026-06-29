@@ -5,7 +5,14 @@ from __future__ import annotations
 from typing import List
 
 from adsentinel.checks.base import BaseCheck, check
-from adsentinel.constants import DEFAULT_PASSWORD_MIN_LENGTH, MITRE_BRUTE_FORCE
+from adsentinel.constants import (
+    DEFAULT_PASSWORD_MIN_LENGTH,
+    MITRE_BRUTE_FORCE,
+    MITRE_CREDENTIALS_IN_ATTRIBUTES,
+    MITRE_LSASS_MEMORY,
+    MITRE_PASS_THE_HASH,
+    MITRE_PASSWORD_SPRAYING,
+)
 from adsentinel.models.compliance import MitreAttack
 from adsentinel.models.finding import AffectedObject, Finding
 from adsentinel.models.severity import Severity
@@ -35,6 +42,7 @@ class PP011_NoFGPP(BaseCheck):
                     "-PasswordHistoryCount 24 -MaxPasswordAge 60.00:00:00 "
                     "-LockoutThreshold 3 -LockoutDuration 00:30:00"
                 ),
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 cis_controls=["5.2"],
                 nist_800_53=["IA-5"],
             )]
@@ -59,6 +67,7 @@ class PP012_FGPPWeakLength(BaseCheck):
                     affected_objects=[AffectedObject(dn=fgpp.dn, sam_account_name=fgpp.name, object_type="fgpp")],
                     remediation_desc=f"Increase minimum length to at least {DEFAULT_PASSWORD_MIN_LENGTH} characters.",
                     powershell=f"Set-ADFineGrainedPasswordPolicy -Identity '{fgpp.name}' -MinPasswordLength {DEFAULT_PASSWORD_MIN_LENGTH}",
+                    mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                     nist_800_53=["IA-5"],
                 ))
         return findings
@@ -82,6 +91,7 @@ class PP013_FGPPNoComplexity(BaseCheck):
                     affected_objects=[AffectedObject(dn=fgpp.dn, sam_account_name=fgpp.name, object_type="fgpp")],
                     remediation_desc="Enable complexity requirements on this FGPP.",
                     powershell=f"Set-ADFineGrainedPasswordPolicy -Identity '{fgpp.name}' -ComplexityEnabled $true",
+                    mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                     nist_800_53=["IA-5"],
                 ))
         return findings
@@ -105,6 +115,7 @@ class PP014_FGPPReversibleEncryption(BaseCheck):
                     affected_objects=[AffectedObject(dn=fgpp.dn, sam_account_name=fgpp.name, object_type="fgpp")],
                     remediation_desc="Disable reversible encryption on this FGPP.",
                     powershell=f"Set-ADFineGrainedPasswordPolicy -Identity '{fgpp.name}' -ReversibleEncryptionEnabled $false",
+                    mitre=[MitreAttack(technique_id=MITRE_LSASS_MEMORY, technique_name="LSASS Memory", tactic="Credential Access")],
                     nist_800_53=["IA-5", "SC-28"],
                 ))
         return findings
@@ -204,6 +215,7 @@ class PP018_NeverSetPassword(BaseCheck):
                 affected_count=len(never_set),
                 remediation_desc="Force password change at next logon for these accounts.",
                 powershell="Get-ADUser -Filter {pwdLastSet -eq 0 -and Enabled -eq $true} | Set-ADUser -ChangePasswordAtLogon $true",
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 nist_800_53=["IA-5"],
             )]
         return []
@@ -234,6 +246,7 @@ class PP019_PasswordInDescription(BaseCheck):
                 affected_count=len(suspicious),
                 remediation_desc="Remove passwords from description fields and reset the affected account passwords.",
                 powershell="Get-ADUser -Filter * -Properties Description | Where-Object {$_.Description -match 'password|pwd|pass:'} | Select-Object SamAccountName, Description",
+                mitre=[MitreAttack(technique_id=MITRE_CREDENTIALS_IN_ATTRIBUTES, technique_name="Credentials In Files", tactic="Credential Access")],
                 nist_800_53=["IA-5", "SC-28"],
             )]
         return []
@@ -261,6 +274,7 @@ class PP020_LMHashStorage(BaseCheck):
                 severity=Severity.HIGH,
                 remediation_desc="Raise domain functional level and ensure NoLMHash policy is enabled via GPO.",
                 powershell="Set-ADDomainMode -Identity (Get-ADDomain) -DomainMode Windows2008R2Domain",
+                mitre=[MitreAttack(technique_id=MITRE_PASS_THE_HASH, technique_name="Pass the Hash", tactic="Lateral Movement")],
                 nist_800_53=["IA-5", "SC-13"],
             )]
         return []

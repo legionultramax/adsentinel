@@ -11,6 +11,9 @@ from adsentinel.constants import (
     DEFAULT_PASSWORD_HISTORY,
     DEFAULT_PASSWORD_MIN_LENGTH,
     MITRE_BRUTE_FORCE,
+    MITRE_CREDENTIALS_IN_ATTRIBUTES,
+    MITRE_LSASS_MEMORY,
+    MITRE_PASS_THE_HASH,
     MITRE_PASSWORD_SPRAYING,
 )
 from adsentinel.models.compliance import MitreAttack
@@ -126,6 +129,7 @@ class PP004_MaxPasswordAge(BaseCheck):
                 severity=Severity.MEDIUM,
                 remediation_desc=f"Set maximum password age to {DEFAULT_MAX_PASSWORD_AGE_DAYS} days or use FGPP for sensitive accounts.",
                 powershell=f"Set-ADDefaultDomainPasswordPolicy -Identity {self.context.domain_info.dns_name} -MaxPasswordAge {DEFAULT_MAX_PASSWORD_AGE_DAYS}.00:00:00",
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 nist_800_53=["IA-5"],
             )]
         elif policy.max_age_days > DEFAULT_MAX_PASSWORD_AGE_DAYS:
@@ -135,6 +139,7 @@ class PP004_MaxPasswordAge(BaseCheck):
                 severity=Severity.LOW,
                 remediation_desc=f"Reduce maximum password age to {DEFAULT_MAX_PASSWORD_AGE_DAYS} days.",
                 powershell=f"Set-ADDefaultDomainPasswordPolicy -Identity {self.context.domain_info.dns_name} -MaxPasswordAge {DEFAULT_MAX_PASSWORD_AGE_DAYS}.00:00:00",
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 nist_800_53=["IA-5"],
             )]
         return []
@@ -159,6 +164,7 @@ class PP005_MinPasswordAge(BaseCheck):
                 severity=Severity.MEDIUM,
                 remediation_desc="Set minimum password age to at least 1 day.",
                 powershell=f"Set-ADDefaultDomainPasswordPolicy -Identity {self.context.domain_info.dns_name} -MinPasswordAge 1.00:00:00",
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 cis_controls=["5.2"],
                 nist_800_53=["IA-5"],
             )]
@@ -181,6 +187,7 @@ class PP006_PasswordHistory(BaseCheck):
                 severity=Severity.MEDIUM if policy.history_count < 12 else Severity.LOW,
                 remediation_desc=f"Set password history to remember at least {DEFAULT_PASSWORD_HISTORY} passwords.",
                 powershell=f"Set-ADDefaultDomainPasswordPolicy -Identity {self.context.domain_info.dns_name} -PasswordHistoryCount {DEFAULT_PASSWORD_HISTORY}",
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 cis_controls=["5.2"],
                 nist_800_53=["IA-5"],
             )]
@@ -207,6 +214,7 @@ class PP007_ReversibleEncryption(BaseCheck):
                 severity=Severity.CRITICAL,
                 remediation_desc="Disable reversible encryption and force password resets for all affected accounts.",
                 powershell=f"Set-ADDefaultDomainPasswordPolicy -Identity {self.context.domain_info.dns_name} -ReversibleEncryptionEnabled $false",
+                mitre=[MitreAttack(technique_id=MITRE_LSASS_MEMORY, technique_name="LSASS Memory", tactic="Credential Access")],
                 cis_controls=["3.11"],
                 nist_800_53=["IA-5", "SC-28"],
                 stig_rules=["V-36435"],
@@ -230,6 +238,7 @@ class PP008_LockoutDuration(BaseCheck):
                 severity=Severity.LOW,
                 remediation_desc="Set lockout duration to 15-30 minutes for automatic unlock.",
                 powershell=f"Set-ADDefaultDomainPasswordPolicy -Identity {self.context.domain_info.dns_name} -LockoutDuration 00:30:00",
+                mitre=[MitreAttack(technique_id=MITRE_PASSWORD_SPRAYING, technique_name="Password Spraying", tactic="Credential Access")],
                 nist_800_53=["AC-7"],
             )]
         elif policy.lockout_threshold > 0 and policy.lockout_duration_minutes < 15:
@@ -239,6 +248,7 @@ class PP008_LockoutDuration(BaseCheck):
                 severity=Severity.LOW,
                 remediation_desc="Increase lockout duration to at least 15 minutes.",
                 powershell=f"Set-ADDefaultDomainPasswordPolicy -Identity {self.context.domain_info.dns_name} -LockoutDuration 00:15:00",
+                mitre=[MitreAttack(technique_id=MITRE_PASSWORD_SPRAYING, technique_name="Password Spraying", tactic="Credential Access")],
                 nist_800_53=["AC-7"],
             )]
         return []
@@ -269,6 +279,7 @@ class PP009_StalePasswords(BaseCheck):
                 affected_count=len(stale_users),
                 remediation_desc="Force password reset for accounts with stale passwords.",
                 powershell="Get-ADUser -Filter {PasswordLastSet -lt (Get-Date).AddDays(-365) -and Enabled -eq $true} | Set-ADUser -ChangePasswordAtLogon $true",
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 nist_800_53=["IA-5"],
             )]
         return []
@@ -299,6 +310,7 @@ class PP010_PasswordNeverExpires(BaseCheck):
                 affected_count=len(never_expires),
                 remediation_desc="Remove 'Password Never Expires' flag. Use FGPP for service accounts that need longer rotation periods.",
                 powershell="Get-ADUser -Filter {PasswordNeverExpires -eq $true -and Enabled -eq $true} | Set-ADUser -PasswordNeverExpires $false",
+                mitre=[MitreAttack(technique_id=MITRE_BRUTE_FORCE, technique_name="Brute Force", tactic="Credential Access")],
                 nist_800_53=["IA-5"],
                 details={"admin_count": len(admin_never_expires)},
             )]
