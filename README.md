@@ -8,26 +8,31 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python 3.9+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
   <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/code%20style-ruff-000000.svg" alt="Code style: ruff"></a>
-  <img src="https://img.shields.io/badge/checks-152-blueviolet" alt="152 Security Checks">
-  <img src="https://img.shields.io/badge/tests-302%20passing-brightgreen" alt="302 Tests Passing">
+  <img src="https://img.shields.io/badge/checks-167-blueviolet" alt="167 Security Checks">
+  <img src="https://img.shields.io/badge/tests-303%20passing-brightgreen" alt="303 Tests Passing">
   <img src="https://img.shields.io/badge/coverage-71%25-yellowgreen" alt="71% Coverage">
 </p>
 
 ---
 
-**ADSentinel** is a read-only Active Directory security assessment tool that runs **152 security checks** across **16 categories**. It connects via LDAP/LDAPS and optionally WinRM to audit Kerberos attacks, privilege escalation paths, AD CS abuse (ESC1-ESC13), ACL misconfigurations, coercion vectors, authentication weaknesses, and operational gaps. It produces interactive reports with posture scoring, attack path analysis, MITRE ATT&CK mapping, and multi-framework compliance coverage.
+**ADSentinel** is a read-only Active Directory security assessment tool that runs **167 security checks** across **16 categories**. It connects via LDAP/LDAPS and optionally WinRM to audit Kerberos attacks, privilege escalation paths, AD CS abuse (ESC1-ESC13), ACL misconfigurations, coercion vectors, authentication weaknesses, SYSVOL GPO risks, and operational gaps. It produces interactive reports with posture scoring, attack path analysis, MITRE ATT&CK mapping, and multi-framework compliance coverage.
 
 > **Read-only by design.** ADSentinel never modifies Active Directory. It uses only LDAP search queries and PowerShell `Get-*` commands.
 
 ---
 
-## What's New in v1.3.0
+## What's New in v1.4.0
 
-**Production-Grade Reliability Upgrades**
+**15 new checks. SYSVOL scanning. ACL collection. Word reports.**
 
-- **Audit Logging**: Full traceability — who ran the scan, from which machine, detailed outcomes, and structured `adsentinel.log` output.
-- **LDAP Resilience**: Automatic retries, reconnection, and partial result warnings. No more lost scans on flaky networks.
-- Perfect for enterprise, MSSP, and DFIR environments.
+- **GPO-010 — Overly Broad SeRemoteInteractiveLogonRight**: Parses every `GptTmpl.inf` in SYSVOL for RDP logon right grants to broad groups (Everyone, Authenticated Users, Domain Users). CRITICAL for domain-wide grants, HIGH for non-standard SIDs.
+- **GPO-011 — Overly Broad Local Administrators via GPO**: Scans both Restricted Groups (`[Group Membership]`) and Group Policy Preferences (`Groups.xml`) for local Administrators assignments. Three-tier SID classification — safe, broad, review — fires per GPO.
+- **KRB-016 — KRBTGT Account Security Audit**: Rename-proof audit via RID 502. Flags SPNs (kerberoastable KRBTGT = Golden Ticket pre-condition), pre-auth disabled, unconstrained delegation, and S4U2Self — each sub-finding is a strong indicator of adversary tampering.
+- **TIER-004 — Privileged Accounts Not Marked Sensitive**: Flags Tier 0 accounts without `AccountNotDelegated`, leaving them exposed to TGT forwarding via unconstrained delegation services.
+- **TIER-009 — Authentication Policy/Silo Absence**: Detects when `msDS-AuthNPolicy` and `msDS-AuthNPolicySilo` objects are absent on Windows Server 2012 R2+ domains. Two-state: feature not deployed (HIGH) or partial coverage with unassigned Tier 0 accounts (MEDIUM).
+- **ACL Collector**: Dedicated collector for `nTSecurityDescriptor` parsing — feeds WriteDACL/WriteOwner/GenericAll checks without redundant LDAP queries.
+- **DOCX Reporter**: Word document output with executive summary table, per-finding detail pages, MITRE ATT&CK mapping grid, and Cyber Gate Defense branding.
+- **Test suite**: 303 passing, 0 failures. Stale AUTH-009 and TIER-004 tests corrected to match current check logic.
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
@@ -58,10 +63,12 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 | Feature | Details |
 |---|---|
-| **152 security checks** | Organized across 16 categories with unique IDs (PP-001, KRB-003, ADCS-008, etc.) |
+| **167 security checks** | Organized across 16 categories with unique IDs (PP-001, KRB-003, ADCS-008, etc.) |
 | **AD CS ESC1-ESC13** | Full coverage of all known certificate abuse vectors |
+| **SYSVOL GPO scanning** | GptTmpl.inf (Restricted Groups, User Rights) + GPP Groups.xml parsed via WinRM |
+| **AuthN Policy/Silo detection** | Flags absence of Windows Server 2012 R2+ Kerberos armoring controls for Tier 0 |
 | **8 attack paths** | Human-readable narratives showing paths to Domain Admin |
-| **7 report formats** | HTML (interactive dark theme), JSON, CSV, PDF, SARIF, BloodHound CE, Baseline |
+| **8 report formats** | HTML (interactive dark theme), JSON, CSV, PDF, SARIF, BloodHound CE, Baseline, DOCX |
 | **Differential scanning** | Save baselines, compare scans over time, track new/resolved/regression findings |
 | **4 auth methods** | SIMPLE, NTLM, Kerberos/GSSAPI, Certificate-based |
 | **Credential safety** | Passwords via env vars or YAML files, `SecretStr` internally, never in CLI args |
@@ -72,8 +79,8 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 | **CI/CD integration** | Exit codes: 0=clean, 1=HIGH, 2=CRITICAL, 3=scan failure |
 | **Docker support** | Multi-stage Dockerfile + docker-compose with preflight/scan/quick services |
 | **Offline HTML reports** | Graceful fallback when Chart.js CDN is unavailable (airgapped networks) |
-| **Audit Logging** | New in v1.3.0: Runner identity, machine context, structured logs |
-| **LDAP Resilience** | New in v1.3.0: Retries, reconnection, partial result handling |
+| **Audit Logging** | Runner identity, machine context, structured `adsentinel.log` output |
+| **LDAP Resilience** | Automatic retries, reconnection, partial result handling |
 
 ---
 
@@ -82,22 +89,22 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 | Category | ID Prefix | Count | Focus Areas |
 |---|---|---|---|
 | Password Policy | PP | 20 | Min length, complexity, lockout, history, reversible encryption, FGPP |
-| Privileged Accounts | PA | 15 | DA/EA/SA membership, stale admins, Kerberoastable admins, Protected Users |
-| Kerberos Security | KRB | 15 | Kerberoasting, AS-REP roasting, delegation, DES encryption, LAPS |
-| AD Certificate Services | ADCS | 14 | ESC1-ESC13 template abuse, NTLM relay to ADCS, CA misconfiguration |
-| Authentication Security | AUTH | 12 | NTLMv1, LDAP signing, channel binding, WDigest, Credential Guard |
-| Object Security | OBJ | 10 | Stale objects, SID history abuse, machine account quota, default containers |
-| GPO Security | GPO | 8 | Unlinked GPOs, disabled enforcement, excessive GPOs, SYSVOL integrity |
-| Operational Security | OPS | 8 | Audit policy gaps, event log size, PowerShell logging, tombstone |
-| Coercion Attacks | COER | 8 | PrintSpooler, PetitPotam, DFSCoerce, shadow credentials, RBCD abuse |
-| Tiered Administration | TIER | 8 | Cross-tier violations, PAW compliance, tier-0 isolation, gMSA adoption |
-| ACL/DACL Security | ACL | 7 | WriteDACL, WriteOwner, GenericAll, shadow admin detection |
+| Privileged Accounts | PA | 16 | DA/EA/SA membership, stale admins, Kerberoastable admins, never-logged-on |
+| Kerberos Security | KRB | 15 | Kerberoasting, AS-REP roasting, delegation, KRBTGT audit, DES, LAPS |
+| AD Certificate Services | ADCS | 15 | ESC1-ESC13 template abuse, NTLM relay to ADCS, CA misconfiguration |
+| Authentication Security | AUTH | 15 | NTLMv1, LDAP signing, channel binding, WDigest, Credential Guard, RDP NLA |
+| Coercion Attacks | COER | 10 | PrintSpooler, PetitPotam, DFSCoerce, shadow credentials, LLMNR/NBT-NS |
+| GPO Security | GPO | 11 | GPP passwords, SYSVOL RDP rights, local admin assignments, GPO hygiene |
+| Object Security | OBJ | 10 | Stale objects, SID history abuse, duplicate SPNs, default containers |
+| ACL/DACL Security | ACL | 10 | WriteDACL, WriteOwner, GenericAll, DCSync rights, AdminSDHolder backdoor |
+| Operational Security | OPS | 9 | Audit policy gaps, event log size, PowerShell logging, WinRM coverage |
+| Tiered Administration | TIER | 8 | Sensitive-not-delegated, AuthN Silos, cross-tier violations, PAW, gMSA |
 | Hybrid/Cloud Identity | HYB | 7 | AAD Connect, PHS/PTA, seamless SSO, privileged sync accounts |
-| Trust Security | TR | 5 | Bidirectional trusts, SID filtering, unconstrained delegation across trusts |
-| DNS Security | DNS | 5 | Zone transfer, dynamic updates, WPAD blocking, scavenging, wildcards |
+| DNS Security | DNS | 6 | Zone transfer, dynamic updates, WPAD blocking, scavenging, wildcards, IPv6 |
 | Replication Security | REP | 5 | DCSync permissions, RODC credential caching, DC password age |
 | SCCM/MECM | SCCM | 5 | NAA exposure, PXE abuse, client push accounts, site server risk |
-| **Total** | | **152** | |
+| Trust Security | TR | 5 | Bidirectional trusts, SID filtering, selective authentication |
+| **Total** | | **167** | |
 
 ---
 
@@ -159,7 +166,7 @@ pip install -e ".[all]"
 - Python 3.9, 3.10, 3.11, or 3.12
 - Network access to a Domain Controller (LDAP 389 or LDAPS 636)
 - AD account with read access (Domain Users minimum)
-- Optional: WinRM access (5985/5986) for audit policy, SMB config, and registry checks
+- Optional: WinRM access (5985/5986) for audit policy, SMB config, registry checks, and SYSVOL GPO scanning
 
 ---
 
@@ -231,7 +238,7 @@ adsentinel scan -s dc01.corp.com -d corp.com --auth kerberos \
 adsentinel scan -s dc01.corp.com -d corp.com -u scanner@corp.com \
   --ssl --html report.html
 
-# Without WinRM-based checks
+# Without WinRM-based checks (skips SYSVOL scan, audit policy, SMB/registry checks)
 adsentinel scan -s dc01.corp.com -d corp.com -u scanner@corp.com \
   --no-winrm --html report.html
 ```
@@ -260,6 +267,7 @@ adsentinel scan -s dc01.corp.com -d corp.com -u scanner@corp.com \
   --json report.json \
   --csv report.csv \
   --pdf executive.pdf \
+  --docx report.docx \
   --sarif report.sarif \
   --bloodhound bloodhound.json \
   --baseline-out baseline.json \
@@ -284,7 +292,7 @@ adsentinel checks --list --category "Kerberos Security"
 | `--ssl` | Use LDAPS | false |
 | `--auth` | `simple`, `ntlm`, `kerberos`, `certificate` | simple |
 | `--credential-file` | Path to YAML credential file | none |
-| `--no-winrm` | Skip WinRM-based checks | false |
+| `--no-winrm` | Skip WinRM-based checks (incl. SYSVOL scan) | false |
 | `--categories`, `-c` | Comma-separated categories to include | all |
 | `--checks` | Comma-separated check IDs to run | all |
 | `--exclude` | Comma-separated categories to exclude | none |
@@ -292,6 +300,7 @@ adsentinel checks --list --category "Kerberos Security"
 | `--json` | JSON report output path | none |
 | `--csv` | CSV report output path | none |
 | `--pdf` | PDF executive summary path | none |
+| `--docx` | Word document report path | none |
 | `--sarif` | SARIF output path (GitHub Advanced Security) | none |
 | `--bloodhound` | BloodHound CE v5 JSON export path | none |
 | `--baseline-in` | Previous baseline file for comparison | none |
@@ -306,13 +315,14 @@ adsentinel checks --list --category "Kerberos Security"
 
 | Format | Extension | Use Case |
 |---|---|---|
-| **HTML** | `.html` | Interactive browser review -- Chart.js charts, MITRE grid, severity filters, search, collapsible findings, dark theme. Works offline with graceful fallback. |
+| **HTML** | `.html` | Interactive browser review — Chart.js charts, MITRE grid, severity filters, search, collapsible findings, dark theme. Works offline. |
 | **JSON** | `.json` | SIEM/SOAR ingestion, programmatic analysis, API consumption |
 | **CSV** | `.csv` | Spreadsheet review, ticket creation, data import |
 | **PDF** | `.pdf` | One-page executive summary for management (requires `weasyprint`) |
+| **DOCX** | `.docx` | Word document with full finding detail, MITRE mapping, and executive summary table |
 | **SARIF** | `.sarif` | GitHub Advanced Security code scanning integration |
 | **BloodHound** | `.json` | Import into BloodHound CE v5 for attack graph visualization |
-| **Baseline** | `.json` | Differential scanning -- save/load/compare to track changes over time |
+| **Baseline** | `.json` | Differential scanning — save/load/compare to track changes over time |
 
 ---
 
@@ -382,7 +392,7 @@ The diff report shows:
 - **New findings** that appeared since last scan
 - **Resolved findings** that were remediated
 - **Score trend** with delta (improved / degraded / unchanged)
-- **Grade change** (e.g., D -> C)
+- **Grade change** (e.g., D → C)
 
 ---
 
@@ -478,40 +488,42 @@ src/adsentinel/
     winrm_source.py       # WinRM PowerShell execution (read-only, input-sanitized)
 
   collectors/             # Run once per scan, populate SharedContext
-    domain_info.py        #   Domain config, functional level, DCs, FSMO roles
-    users.py              #   User objects with 15+ security attributes
+    domain_info.py        #   Domain config, functional level, DCs, AuthN Policies
+    users.py              #   User objects with 25+ security attributes
     groups.py             #   Groups, recursive membership, privileged detection
     computers.py          #   Computers, LAPS v1/v2, delegation, RBCD
     password_policies.py  #   Domain default + fine-grained password policies
     trusts.py             #   Trust relationships and SID filtering status
     gpo.py                #   Group Policy Objects
     dns.py                #   AD-integrated DNS zones
-    certificates.py       #   Certificate templates, CAs, enrollment services
+    certificates.py       #   Certificate templates, CAs, enrollment services (ESC12)
+    acl_collector.py      #   nTSecurityDescriptor / DACL collection
+    winrm_data.py         #   SYSVOL GptTmpl.inf + GPP Groups.xml + registry/audit
 
   engine/
-    context.py            # SharedContext -- central data store for all collected data
+    context.py            # SharedContext — central data store for all collected data
     plugin_loader.py      # Auto-discovery of checks via importlib
     runner.py             # Sequential executor with per-check error isolation
 
-  checks/                 # 152 checks, each with @check decorator
+  checks/                 # 167 checks, each with @check decorator
     base.py               # BaseCheck ABC + @check decorator + WinRM gating
     registry.py           # Singleton registry with unique ID enforcement
-    password_policy/      # PP-001..020
-    privileged_accounts/  # PA-001..015
-    kerberos/             # KRB-001..015
-    adcs/                 # ADCS-001..014
-    authentication/       # AUTH-001..012
-    acl_dacl/             # ACL-001..007
-    gpo_security/         # GPO-001..008
-    trust_security/       # TR-001..005
-    dns_security/         # DNS-001..005
-    replication/          # REP-001..005
-    operational/          # OPS-001..008
-    object_security/      # OBJ-001..010
-    hybrid_cloud/         # HYB-001..007
-    coercion/             # COER-001..008
-    tiered_admin/         # TIER-001..008
-    sccm/                 # SCCM-001..005
+    password_policy/      # PP-001..020  (20 checks)
+    privileged_accounts/  # PA-001..016  (16 checks)
+    kerberos/             # KRB-001..016 (15 checks)
+    adcs/                 # ADCS-001..015 (15 checks)
+    authentication/       # AUTH-001..015 (15 checks)
+    coercion/             # COER-001..010 (10 checks)
+    gpo_security/         # GPO-001..011 (11 checks — incl. SYSVOL RDP + local admin)
+    object_security/      # OBJ-001..010 (10 checks)
+    acl_dacl/             # ACL-001..010 (10 checks)
+    operational/          # OPS-001..008 + WINRM-001 (9 checks)
+    tiered_admin/         # TIER-001..009 (8 checks — incl. AuthN Silo, sensitive flag)
+    hybrid_cloud/         # HYB-001..007 (7 checks)
+    dns_security/         # DNS-001..006 (6 checks)
+    replication/          # REP-001..005 (5 checks)
+    sccm/                 # SCCM-001..005 (5 checks)
+    trust_security/       # TR-001..005  (5 checks)
 
   models/
     severity.py           # CRITICAL/HIGH/MEDIUM/LOW/INFO with scoring weights
@@ -527,6 +539,7 @@ src/adsentinel/
     json_reporter.py      # Structured JSON for SIEM/SOAR
     csv_reporter.py       # CSV export for spreadsheets / ticketing
     pdf_reporter.py       # Executive summary PDF (WeasyPrint)
+    docx_reporter.py      # Word document with full findings + MITRE grid
     sarif_reporter.py     # SARIF v2.1.0 for GitHub Advanced Security
     bloodhound_reporter.py # BloodHound CE v5 JSON export
     baseline.py           # Differential scanning (save/load/compare)
@@ -559,7 +572,7 @@ src/adsentinel/
 ## Testing
 
 ```bash
-# Run all 302 tests
+# Run all 303 tests
 pytest tests/ -v
 
 # With coverage report
@@ -592,10 +605,13 @@ bandit -r src/adsentinel/
 | **Kerberos bind fails** | Verify ticket with `klist`. Install extras: `pip install -e ".[kerberos]"`. |
 | **No user objects returned** | Scanning account may lack read permissions. Verify it's in Domain Users. |
 | **WinRM errors** | WinRM is optional. Use `--no-winrm` to skip. If needed, check port 5985/5986 and run `winrm quickconfig` on the DC. |
+| **GPO-010/011 return no findings** | Requires WinRM. Verify the scanning account can reach SYSVOL (`\\domain\SYSVOL`). |
+| **TIER-009 not firing** | Domain functional level must be ≥ 6 (Windows Server 2012 R2). Check with `Get-ADDomain \| Select-Object DomainMode`. |
 | **Scan is slow** | Reduce concurrency: `--max-concurrent 5`. Target specific categories: `--categories "Password Policy"`. |
 | **Scan reports "SCAN FAILED"** | Run `adsentinel preflight` to diagnose. Usually a connectivity or auth issue. |
 | **Charts blank in HTML report** | Report was opened offline. Chart.js loads from CDN. Data tables below charts contain all the same information. |
 | **PDF generation fails** | Install WeasyPrint: `pip install -e ".[pdf]"`. Requires system dependencies on Linux (`libpango`, `libcairo`). |
+| **DOCX generation fails** | Install python-docx: `pip install python-docx`. Included in `.[all]` extras. |
 
 ---
 
