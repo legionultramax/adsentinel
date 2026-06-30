@@ -50,12 +50,12 @@ class WinRMSource(DataSource):
             username = self.config.get_winrm_username()
             password = self.config.get_winrm_password()
 
-            # Transport priority: kerberos (explicit) → negotiate (SSPI) → ntlm (fallback)
-            # negotiate requires pywinrm[negotiate]; ntlm requires pywinrm[ntlm] or requests-ntlm
+            # Transport priority: kerberos (explicit) → ntlm → negotiate (SSPI)
+            # ntlm requires requests-ntlm; negotiate requires requests_negotiate_sspi
             if self.config.auth_method.value == "kerberos":
                 transports = ["kerberos"]
             else:
-                transports = ["negotiate", "ntlm"]
+                transports = ["ntlm", "negotiate"]
 
             last_exc: Exception = Exception("no transport attempted")
             for transport in transports:
