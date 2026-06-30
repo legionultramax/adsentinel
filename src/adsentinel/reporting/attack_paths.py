@@ -77,29 +77,22 @@ def analyze_attack_paths(context: Any, findings: List[Any]) -> List[AttackPath]:
 
     finding_ids = {f.id for f in findings}
 
-    # Path 1: Kerberoasting → Domain Admin
-    _check_kerberoast_path(context, finding_ids, paths)
+    _PATH_CHECKS = [
+        ("kerberoast", _check_kerberoast_path),
+        ("asrep", _check_asrep_path),
+        ("unconstrained_coerce", _check_unconstrained_coerce_path),
+        ("esc1", _check_esc1_path),
+        ("esc8_coerce", _check_esc8_coerce_path),
+        ("rbcd", _check_rbcd_path),
+        ("shadow_cred", _check_shadow_cred_path),
+        ("aad_connect", _check_aad_connect_path),
+    ]
 
-    # Path 2: ASREPRoast → Credential → Lateral Movement
-    _check_asrep_path(context, finding_ids, paths)
-
-    # Path 3: Unconstrained Delegation + Coercion → DC TGT
-    _check_unconstrained_coerce_path(context, finding_ids, paths)
-
-    # Path 4: ADCS ESC1 → Certificate as DA
-    _check_esc1_path(context, finding_ids, paths)
-
-    # Path 5: ADCS ESC8 + Coercion → DC Certificate
-    _check_esc8_coerce_path(context, finding_ids, paths)
-
-    # Path 6: RBCD + MAQ → Privilege Escalation
-    _check_rbcd_path(context, finding_ids, paths)
-
-    # Path 7: Shadow Credentials → Impersonation
-    _check_shadow_cred_path(context, finding_ids, paths)
-
-    # Path 8: AAD Connect → DCSync
-    _check_aad_connect_path(context, finding_ids, paths)
+    for name, fn in _PATH_CHECKS:
+        try:
+            fn(context, finding_ids, paths)
+        except Exception as exc:
+            logger.warning("attack_path_check_failed", path=name, error=str(exc))
 
     logger.info("attack_paths_analyzed", count=len(paths))
     return paths
@@ -238,7 +231,11 @@ def _check_esc1_path(context: Any, fids: set, paths: List[AttackPath]) -> None:
 
 def _check_esc8_coerce_path(context: Any, fids: set, paths: List[AttackPath]) -> None:
     """ESC8 HTTP enrollment + coercion → DC certificate."""
-    http_cas = [es for es in context.enrollment_services if es.get("has_http_enrollment")]
+    # Match ADCS-008 check condition: HTTP enrollment flag OR any enrollment server configured
+    http_cas = [
+        es for es in context.enrollment_services
+        if es.get("has_http_enrollment") or es.get("enrollment_servers")
+    ]
     if http_cas:
         path = AttackPath(
             "Coercion + ESC8 → DC Certificate",

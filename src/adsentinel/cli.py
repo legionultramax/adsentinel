@@ -48,6 +48,7 @@ def cli(ctx: click.Context) -> None:
 @click.option("--auth", type=click.Choice(["simple", "ntlm", "kerberos", "certificate"]), default="simple", help="Authentication method")
 @click.option("--credential-file", type=click.Path(exists=True), help="YAML credential file path")
 @click.option("--no-winrm", is_flag=True, help="Skip WinRM-based checks")
+@click.option("--winrm-user", "winrm_username", default="", help="WinRM username if different from LDAP user (password via ADSENTINEL_WINRM_PASSWORD env var)")
 @click.option("--categories", "-c", default="", help="Comma-separated check categories")
 @click.option("--checks", default="", help="Comma-separated specific check IDs")
 @click.option("--exclude", default="", help="Comma-separated categories to exclude")
@@ -71,6 +72,7 @@ def scan(
     auth: str,
     credential_file: Optional[str],
     no_winrm: bool,
+    winrm_username: str,
     categories: str,
     checks: str,
     exclude: str,
@@ -102,6 +104,7 @@ def scan(
         auth_method=AuthMethod(auth),
         credential_file=credential_file,
         use_winrm=not no_winrm,
+        winrm_username=winrm_username or None,
         categories=[c.strip() for c in categories.split(",") if c.strip()],
         check_ids=[c.strip() for c in checks.split(",") if c.strip()],
         exclude_categories=[c.strip() for c in exclude.split(",") if c.strip()],

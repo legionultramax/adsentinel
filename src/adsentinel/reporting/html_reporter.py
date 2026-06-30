@@ -159,6 +159,48 @@ header .subtitle {{ color: var(--text-secondary); font-size: 1.1em; }}
     font-size: 1.1em;
 }}
 .chart-card canvas {{ max-height: 300px; }}
+.coverage-banner {{
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 24px 0;
+    font-size: 14px;
+    line-height: 1.6;
+}}
+.coverage-ok {{
+    background: rgba(35,134,54,0.15);
+    border: 1px solid #238636;
+    color: #3fb950;
+}}
+.coverage-warn {{
+    background: rgba(187,128,9,0.15);
+    border: 1px solid #bb8009;
+    color: #e3b341;
+}}
+.coverage-icon {{ font-size: 16px; margin-right: 6px; }}
+.coverage-ids {{
+    display: flex; flex-wrap: wrap; gap: 6px;
+    margin-top: 10px;
+}}
+.coverage-badge {{
+    background: rgba(187,128,9,0.25);
+    border: 1px solid #bb8009;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-family: monospace;
+    color: #e3b341;
+}}
+.coverage-hint {{
+    margin-top: 10px;
+    font-size: 12px;
+    color: #8b949e;
+}}
+.coverage-hint code {{
+    background: rgba(110,118,129,0.2);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: monospace;
+}}
 .mitre-section {{
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -393,6 +435,8 @@ footer {{
     </div>
 </div>
 
+{_render_coverage_banner(scan_result)}
+
 {_render_mitre_section(mitre_data)}
 
 <div class="controls">
@@ -527,6 +571,43 @@ def _build_mitre_data(findings: List[Any]) -> List[Dict[str, str]]:
                 }
 
     return sorted(technique_map.values(), key=lambda t: severity_rank.get(t["severity"], 5))
+
+
+def _render_coverage_banner(scan_result: Any) -> str:
+    """Render a WinRM coverage status banner — green if active, orange if skipped."""
+    context = getattr(scan_result, "context", None)
+    has_winrm = context.has_winrm_data if context else False
+
+    if has_winrm:
+        skipped_count = sum(1 for r in scan_result.check_results if r.skipped)
+        return f"""
+<div class="coverage-banner coverage-ok">
+    <span class="coverage-icon">&#10003;</span>
+    <strong>WinRM Active</strong> — All registry, service, and host-level checks executed.
+    {f'({skipped_count} checks skipped for other reasons)' if skipped_count else 'Full coverage achieved.'}
+</div>"""
+
+    # WinRM unavailable — enumerate which checks were silently skipped
+    skipped_results = [r for r in scan_result.check_results if r.skipped and "WinRM" in (r.skip_reason or "")]
+    skipped_ids = sorted(r.check_id for r in skipped_results)
+    count = len(skipped_ids)
+
+    if count == 0:
+        return ""
+
+    id_badges = "".join(f'<span class="coverage-badge">{html.escape(cid)}</span>' for cid in skipped_ids)
+
+    return f"""
+<div class="coverage-banner coverage-warn">
+    <span class="coverage-icon">&#9888;</span>
+    <strong>WinRM Unavailable</strong> — {count} checks could not run. Results below reflect LDAP-only access.
+    Re-run with WinRM credentials for complete coverage.
+    <div class="coverage-ids">{id_badges}</div>
+    <div class="coverage-hint">
+        Enable: <code>winrm quickconfig -quiet</code> on the DC, then re-run:
+        <code>adsentinel scan --server &lt;dc&gt; --domain &lt;domain&gt; --username &lt;user&gt;</code>
+    </div>
+</div>"""
 
 
 def _render_mitre_section(mitre_data: List[Dict[str, str]]) -> str:

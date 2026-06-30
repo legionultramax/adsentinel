@@ -53,6 +53,8 @@ class ScanConfig(BaseSettings):
     use_winrm: bool = Field(default=True, description="Enable WinRM-based checks")
     winrm_port: int = Field(default=5985, description="WinRM port")
     winrm_ssl: bool = Field(default=False, description="Use WinRM over HTTPS")
+    winrm_username: Optional[str] = Field(default=None, description="WinRM username (defaults to LDAP username)")
+    winrm_password: Optional[SecretStr] = Field(default=None, description="WinRM password (defaults to LDAP password, env: ADSENTINEL_WINRM_PASSWORD)")
 
     # Scan scope
     categories: List[str] = Field(default_factory=list, description="Check categories to run (empty = all)")
@@ -115,7 +117,21 @@ class ScanConfig(BaseSettings):
                         self.server = creds["server"]
                     if "domain" in creds and not self.domain:
                         self.domain = creds["domain"]
+                    if "winrm_username" in creds and not self.winrm_username:
+                        self.winrm_username = creds["winrm_username"]
+                    if "winrm_password" in creds and not self.winrm_password:
+                        self.winrm_password = SecretStr(creds["winrm_password"])
         return self
+
+    def get_winrm_username(self) -> str:
+        """Effective WinRM username — dedicated if set, else falls back to LDAP username."""
+        return self.winrm_username or self.username
+
+    def get_winrm_password(self) -> str:
+        """Effective WinRM password — dedicated if set, else falls back to LDAP password."""
+        if self.winrm_password:
+            return self.winrm_password.get_secret_value()
+        return self.password.get_secret_value()
 
     @property
     def base_dn(self) -> str:
