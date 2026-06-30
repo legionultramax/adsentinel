@@ -52,15 +52,15 @@ class WinRMSource(DataSource):
             if self.config.auth_method.value == "kerberos":
                 transport = "kerberos"
 
-            username = self.config.username
-            password = self.config.password.get_secret_value()
+            username = self.config.get_winrm_username()
+            password = self.config.get_winrm_password()
 
             self._session = winrm.Session(
                 endpoint,
                 auth=(username, password),
                 transport=transport,
                 server_cert_validation="validate" if self.config.winrm_ssl else "ignore",
-                read_timeout_sec=self.config.timeout,
+                read_timeout_sec=self.config.timeout + 10,
                 operation_timeout_sec=self.config.timeout,
             )
 
