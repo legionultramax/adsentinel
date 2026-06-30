@@ -47,28 +47,42 @@ class WinRMSource(DataSource):
             protocol = "https" if self.config.winrm_ssl else "http"
             endpoint = f"{protocol}://{self.config.server}:{self.config.winrm_port}/wsman"
 
-            # negotiate auto-selects Kerberos or NTLM depending on what the DC accepts.
-            # Works whether or not the scanning host is domain-joined.
-            transport = "kerberos" if self.config.auth_method.value == "kerberos" else "negotiate"
-
             username = self.config.get_winrm_username()
             password = self.config.get_winrm_password()
 
-            self._session = winrm.Session(
-                endpoint,
-                auth=(username, password),
-                transport=transport,
-                server_cert_validation="validate" if self.config.winrm_ssl else "ignore",
-                read_timeout_sec=self.config.timeout + 10,
-                operation_timeout_sec=self.config.timeout,
-            )
+            # Transport priority: kerberos (explicit) → negotiate (SSPI) → ntlm (fallback)
+            # negotiate requires pywinrm[negotiate]; ntlm requires pywinrm[ntlm] or requests-ntlm
+            if self.config.auth_method.value == "kerberos":
+                transports = ["kerberos"]
+            else:
+                transports = ["negotiate", "ntlm"]
 
-            # Test connection with a simple command
-            result = self._session.run_ps("$env:COMPUTERNAME")
-            if result.status_code != 0:
-                raise WinRMError("test", f"Connection test failed: {result.std_err.decode()}")
-
-            logger.info("winrm_connected", server=self.config.server, port=self.config.winrm_port)
+            last_exc: Exception = Exception("no transport attempted")
+            for transport in transports:
+                try:
+                    session = winrm.Session(
+                        endpoint,
+                        auth=(username, password),
+                        transport=transport,
+                        server_cert_validation="validate" if self.config.winrm_ssl else "ignore",
+                        read_timeout_sec=self.config.timeout + 10,
+                        operation_timeout_sec=self.config.timeout,
+                    )
+                    result = session.run_ps("$env:COMPUTERNAME")
+                    if result.status_code != 0:
+                        raise WinRMError("test", f"Connection test failed: {result.std_err.decode()}")
+                    self._session = session
+                    logger.info("winrm_connected", server=self.config.server, port=self.config.winrm_port, transport=transport)
+                    break
+                except ImportError:
+                    logger.debug("winrm_transport_unavailable", transport=transport, reason="missing package")
+                    continue
+                except Exception as exc:
+                    last_exc = exc
+                    logger.debug("winrm_transport_failed", transport=transport, error=str(exc))
+                    continue
+            else:
+                raise last_exc
 
         except ImportError:
             self._available = False
