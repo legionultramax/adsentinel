@@ -2,11 +2,19 @@
 
 Provides read-only PowerShell command execution via WinRM.
 Only uses Get-* commands — never modifies the target system.
+
+Connection strategy (in priority order):
+1. subprocess Invoke-Command — uses current Windows SSPI/Kerberos identity.
+   Same approach as Argus-AD. Works on domain-joined machines with no extra config.
+2. pywinrm ntlm — explicit credentials, requires NTLM enabled on DC WinRM listener.
+3. pywinrm negotiate — requires requests_negotiate_sspi package.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 from adsentinel.config import ScanConfig
@@ -16,6 +24,9 @@ from adsentinel.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+_SUBPROCESS_MODE = "subprocess"
+_PYWINRM_MODE = "pywinrm"
+
 
 class WinRMSource(DataSource):
     """WinRM data source for PowerShell-based checks."""
@@ -24,38 +35,67 @@ class WinRMSource(DataSource):
         self.config = config
         self._session: Optional[Any] = None
         self._available = True
+        self._mode: Optional[str] = None  # subprocess or pywinrm
 
     @staticmethod
     def _sanitize_ps_string(value: str) -> str:
-        """Sanitize a value for safe use inside PowerShell single-quoted strings.
-
-        In PS single-quoted strings, the only special char is a single quote
-        itself, which is escaped by doubling it.
-        """
+        """Sanitize a value for safe use inside PowerShell single-quoted strings."""
         return value.replace("'", "''")
 
     def connect(self) -> None:
-        """Establish WinRM connection."""
+        """Establish WinRM connection.
+
+        Tries subprocess Invoke-Command first (Windows SSPI — works on domain-joined
+        machines without explicit credentials). Falls back to pywinrm with explicit
+        credentials if subprocess fails.
+        """
         if not self.config.use_winrm:
             self._available = False
             logger.info("winrm_disabled", reason="--no-winrm flag set")
             return
 
+        # ── Strategy 1: subprocess PowerShell Invoke-Command (Argus-AD approach) ──
+        # Uses current Windows identity (Kerberos TGT) — no credential passing needed.
+        # Only works on Windows with PowerShell available and a valid domain session.
+        if sys.platform == "win32" and self._try_subprocess_connect():
+            return
+
+        # ── Strategy 2: pywinrm with explicit credentials ──
+        self._try_pywinrm_connect()
+
+    def _try_subprocess_connect(self) -> bool:
+        """Test Invoke-Command connectivity using current Windows identity."""
+        try:
+            result = subprocess.run(
+                [
+                    "powershell", "-NonInteractive", "-NoProfile", "-Command",
+                    f"Invoke-Command -ComputerName '{self._sanitize_ps_string(self.config.server)}'"
+                    f" -ScriptBlock {{ $env:COMPUTERNAME }} -ErrorAction Stop",
+                ],
+                capture_output=True, text=True,
+                timeout=self.config.timeout,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self._mode = _SUBPROCESS_MODE
+                self._available = True
+                logger.info("winrm_connected", server=self.config.server, transport="subprocess_invoke_command")
+                return True
+            logger.debug("winrm_subprocess_failed", stdout=result.stdout[:200], stderr=result.stderr[:200])
+        except Exception as exc:
+            logger.debug("winrm_subprocess_error", error=str(exc))
+        return False
+
+    def _try_pywinrm_connect(self) -> None:
+        """Connect via pywinrm with explicit credentials."""
         try:
             import winrm
 
             protocol = "https" if self.config.winrm_ssl else "http"
             endpoint = f"{protocol}://{self.config.server}:{self.config.winrm_port}/wsman"
-
             username = self.config.get_winrm_username()
             password = self.config.get_winrm_password()
 
-            # Transport priority: kerberos (explicit) → ntlm → negotiate (SSPI)
-            # ntlm requires requests-ntlm; negotiate requires requests_negotiate_sspi
-            if self.config.auth_method.value == "kerberos":
-                transports = ["kerberos"]
-            else:
-                transports = ["ntlm", "negotiate"]
+            transports = ["kerberos"] if self.config.auth_method.value == "kerberos" else ["ntlm", "negotiate"]
 
             last_exc: Exception = Exception("no transport attempted")
             for transport in transports:
@@ -72,17 +112,16 @@ class WinRMSource(DataSource):
                     if result.status_code != 0:
                         raise WinRMError("test", f"Connection test failed: {result.std_err.decode()}")
                     self._session = session
-                    logger.info("winrm_connected", server=self.config.server, port=self.config.winrm_port, transport=transport)
-                    break
+                    self._mode = _PYWINRM_MODE
+                    logger.info("winrm_connected", server=self.config.server, transport=transport)
+                    return
                 except ImportError:
                     logger.debug("winrm_transport_unavailable", transport=transport, reason="missing package")
-                    continue
                 except Exception as exc:
                     last_exc = exc
                     logger.debug("winrm_transport_failed", transport=transport, error=str(exc))
-                    continue
-            else:
-                raise last_exc
+
+            raise last_exc
 
         except ImportError:
             self._available = False
@@ -98,24 +137,52 @@ class WinRMSource(DataSource):
 
     def is_connected(self) -> bool:
         """Check if WinRM is available."""
+        if self._mode == _SUBPROCESS_MODE:
+            return self._available
         return self._available and self._session is not None
 
     def run_powershell(self, command: str) -> Optional[str]:
-        """Execute a PowerShell command and return stdout.
-
-        Returns None if WinRM is unavailable (graceful degradation).
-        """
+        """Execute a PowerShell command on the remote host and return stdout."""
         if not self.is_connected():
             return None
 
+        if self._mode == _SUBPROCESS_MODE:
+            return self._run_subprocess_ps(command)
+        return self._run_pywinrm_ps(command)
+
+    def _run_subprocess_ps(self, command: str) -> Optional[str]:
+        """Run command via Invoke-Command using current Windows identity."""
+        try:
+            # Wrap command in Invoke-Command for remote execution
+            remote_cmd = (
+                f"Invoke-Command -ComputerName '{self._sanitize_ps_string(self.config.server)}'"
+                f" -ScriptBlock {{ {command} }} -ErrorAction SilentlyContinue"
+            )
+            result = subprocess.run(
+                ["powershell", "-NonInteractive", "-NoProfile", "-Command", remote_cmd],
+                capture_output=True, text=True,
+                timeout=self.config.timeout + 10,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            logger.warning("winrm_subprocess_command_error", command=command[:80], stderr=result.stderr[:200])
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning("winrm_subprocess_timeout", command=command[:80])
+            return None
+        except Exception as e:
+            logger.warning("winrm_subprocess_command_failed", command=command[:80], error=str(e))
+            return None
+
+    def _run_pywinrm_ps(self, command: str) -> Optional[str]:
+        """Run command via pywinrm session."""
         try:
             result = self._session.run_ps(command)
             if result.status_code == 0:
                 return result.std_out.decode("utf-8", errors="replace").strip()
-            else:
-                stderr = result.std_err.decode("utf-8", errors="replace").strip()
-                logger.warning("winrm_command_error", command=command[:80], error=stderr)
-                return None
+            stderr = result.std_err.decode("utf-8", errors="replace").strip()
+            logger.warning("winrm_command_error", command=command[:80], error=stderr)
+            return None
         except Exception as e:
             logger.warning("winrm_command_failed", command=command[:80], error=str(e))
             return None
