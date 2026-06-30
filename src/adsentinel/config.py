@@ -124,8 +124,17 @@ class ScanConfig(BaseSettings):
         return self
 
     def get_winrm_username(self) -> str:
-        """Effective WinRM username — dedicated if set, else falls back to LDAP username."""
-        return self.winrm_username or self.username
+        """Effective WinRM username for NTLM auth.
+
+        NTLM requires DOMAIN\\user format. If a UPN (user@domain.com) is supplied,
+        auto-convert to NETBIOS\\user so pywinrm's NTLM transport accepts it.
+        """
+        username = self.winrm_username or self.username
+        if "@" in username:
+            user, domain = username.split("@", 1)
+            netbios = domain.split(".")[0].upper()
+            return f"{netbios}\\{user}"
+        return username
 
     def get_winrm_password(self) -> str:
         """Effective WinRM password — dedicated if set, else falls back to LDAP password."""
