@@ -47,10 +47,9 @@ class WinRMSource(DataSource):
             protocol = "https" if self.config.winrm_ssl else "http"
             endpoint = f"{protocol}://{self.config.server}:{self.config.winrm_port}/wsman"
 
-            # Determine auth transport
-            transport = "ntlm"
-            if self.config.auth_method.value == "kerberos":
-                transport = "kerberos"
+            # negotiate auto-selects Kerberos or NTLM depending on what the DC accepts.
+            # Works whether or not the scanning host is domain-joined.
+            transport = "kerberos" if self.config.auth_method.value == "kerberos" else "negotiate"
 
             username = self.config.get_winrm_username()
             password = self.config.get_winrm_password()
